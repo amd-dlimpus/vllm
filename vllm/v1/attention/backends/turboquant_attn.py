@@ -222,6 +222,40 @@ class TurboQuantMetadata(AttentionMetadata):
     num_decodes: int = 0  # number of decode requests (first in batch)
     num_decode_tokens: int = 0  # tokens from decode requests
 
+    # Phase 1E (prefix-tier mixed-precision) two-pool fields. All None
+    # means single-pool behavior (the legacy path). When all are
+    # populated, `forward()` dispatches to the v3_split kernel (decode)
+    # and `_continuation_prefill_split` (prefill chunks 2+).
+    #
+    # Populated by the runner when ``VLLM_TQ_PREFIX_TIER=1`` is active
+    # AND the request has a non-empty pool-A prefix; the metadata builder
+    # signals this via these fields rather than a separate flag so the
+    # forward dispatch can branch on data presence (cleaner CUDA-graph
+    # specialization).
+    pool_a_block_table: torch.Tensor | None = None
+    pool_b_block_table: torch.Tensor | None = None
+    pool_a_seq_lens: torch.Tensor | None = None  # tokens served from pool A per req
+    pool_b_seq_lens: torch.Tensor | None = None  # tokens served from pool B per req
+    # Optional pool-A KV cache reference. When None and two_pool fields
+    # above are set, ``forward()`` re-uses the same ``kv_cache`` for both
+    # pools (i.e. same-codec test/dev mode); production wiring populates
+    # this with the TQ84 cache buffer.
+    pool_a_kv_cache: torch.Tensor | None = None
+    pool_b_kv_cache: torch.Tensor | None = None
+    # Per-pool max seq len for the kernel dispatch heuristic. Inferred from
+    # block-table shape if None.
+    max_pool_a_seq_len: int = 0
+    max_pool_b_seq_len: int = 0
+
+    def is_two_pool(self) -> bool:
+        """True iff the two-pool dispatch path should be taken."""
+        return (
+            self.pool_a_block_table is not None
+            and self.pool_b_block_table is not None
+            and self.pool_a_seq_lens is not None
+            and self.pool_b_seq_lens is not None
+        )
+
 
 class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
     """Builds TurboQuantMetadata from scheduler output."""
@@ -466,6 +500,28 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # single precision (avoids mixed fp16/bf16 matmul + extra .to() in
         # the CUDA-graph-captured region).
         v_inv_rot = tq_layer._tq_VRot_q  # None when value_quant_bits != 2
+
+        # Phase 1E (prefix-tier) two-pool dispatch. Activated only when the
+        # metadata builder populated the pool-A/pool-B fields (which itself
+        # is gated by VLLM_TQ_PREFIX_TIER=1 in the runner). This branch is
+        # specialized to pure decode and pure continuation prefill — mixed
+        # batches under two-pool aren't in MVP scope; if the metadata
+        # builder ever sets two-pool fields on a mixed batch we fall
+        # through to single-pool below to avoid silent miscompiles.
+        if attn_metadata.is_two_pool() and num_decodes == N:
+            # Pure decode under two-pool — use v3_split kernel.
+            attn_out = self._decode_attention_split(
+                q, attn_metadata, Pi, centroids, PiT, layer,
+            )
+            if v_inv_rot is not None:
+                attn_out = (attn_out.reshape(-1, self.head_size) @ v_inv_rot).reshape(
+                    attn_out.shape
+                )
+            if output.ndim == 3:
+                output[:N] = attn_out.to(output.dtype)
+            else:
+                output[:N] = attn_out.reshape(N, -1).to(output.dtype)
+            return output
 
         if not attn_metadata.is_prefill:
             # Pure decode batch — fast path
@@ -827,12 +883,90 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
         return output
 
+    @staticmethod
+    def _dequant_pool_into_buf(
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        centroids: torch.Tensor,
+        cached_len: int,
+        Hk: int,
+        D: int,
+        block_size: int,
+        BLOCK_D: int,
+        # Per-pool TQ layout fields (from a `TurboQuantConfig`).
+        mse_bits: int,
+        mse_bytes: int,
+        val_data_bytes: int,
+        value_quant_bits: int,
+        key_fp8: bool,
+        norm_correction: bool,
+        # Pre-allocated workspace buffers (shape [1, Hk, alloc_len, D]).
+        k_buf: torch.Tensor,
+        v_buf: torch.Tensor,
+        device_index: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Dequant one TQ pool into the pre-allocated fp16 buffers.
+
+        Factored out of `_continuation_prefill` so the two-pool variant
+        (`_continuation_prefill_split`) can call this once per pool with
+        its own layout constants. Returns the same two buffers, sliced
+        to ``cached_len`` (caller is responsible for any further slicing).
+        """
+        alloc_len = math.ceil(cached_len / block_size) * block_size
+        k_cached = k_buf[:, :, :alloc_len, :]
+        v_cached = v_buf[:, :, :alloc_len, :]
+
+        key_data_bytes = D if key_fp8 else mse_bytes
+        data_bytes_per_slot = key_data_bytes + val_data_bytes
+        meta_region_offset = block_size * Hk * data_bytes_per_slot
+        num_soa_fields = 2 if key_fp8 else 3
+        soa_v_scale = 0 if key_fp8 else 1
+        soa_v_zero = 1 if key_fp8 else 2
+        kv_cache_u16 = kv_cache.view(torch.uint16)
+
+        grid = (alloc_len, 1 * Hk)
+        _tq_full_dequant_kv[grid](
+            kv_cache,
+            kv_cache_u16,
+            block_table,
+            centroids,
+            k_cached,
+            v_cached,
+            k_cached.stride(0),
+            k_cached.stride(1),
+            k_cached.stride(2),
+            v_cached.stride(0),
+            v_cached.stride(1),
+            v_cached.stride(2),
+            kv_cache.stride(0),
+            block_table.stride(0),
+            HEAD_DIM=D,
+            BLOCK_SIZE=block_size,
+            NUM_KV_HEADS=Hk,
+            MSE_BYTES=mse_bytes,
+            VQB=value_quant_bits,
+            VAL_DATA_BYTES=val_data_bytes,
+            MSE_BITS=mse_bits,
+            KEY_FP8=1 if key_fp8 else 0,
+            KEY_DATA_BYTES=key_data_bytes,
+            META_REGION_OFFSET=meta_region_offset,
+            NUM_SOA_FIELDS=num_soa_fields,
+            SOA_K_NORM=0,  # MSE-only (FP8 ignores)
+            SOA_V_SCALE=soa_v_scale,
+            SOA_V_ZERO=soa_v_zero,
+            BLOCK_D=BLOCK_D,
+            NORM_CORRECTION=1 if norm_correction else 0,
+            FP8_E4B15=_use_fp8_e4b15(device_index),
+            num_warps=4,
+        )
+        return k_cached, v_cached
+
     def _continuation_prefill_split(
         self,
         layer: Any,
-        query: torch.Tensor,
-        key_chunk: torch.Tensor,
-        val_chunk: torch.Tensor,
+        query: torch.Tensor,  # (q_len, Hq, D)
+        key_chunk: torch.Tensor,  # (q_len, Hk, D) — current chunk (raw)
+        val_chunk: torch.Tensor,  # (q_len, Hk, D)
         pool_a_kv_cache: torch.Tensor,
         pool_b_kv_cache: torch.Tensor,
         pool_a_block_table: torch.Tensor,
@@ -840,40 +974,49 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         pool_a_cached_len: int,
         pool_b_cached_len: int,
         seq_len: int,
-        pool_a_Pi: torch.Tensor,
+        # Pool A codec (TQ84 in production: key_fp8=True, val_quant_bits=4).
         pool_a_centroids: torch.Tensor,
-        pool_b_Pi: torch.Tensor,
+        pool_a_mse_bits: int,
+        pool_a_mse_bytes: int,
+        pool_a_val_data_bytes: int,
+        pool_a_value_quant_bits: int,
+        pool_a_key_fp8: bool,
+        pool_a_norm_correction: bool,
+        # Pool B codec (TQ44 in production: key_fp8=False, val_quant_bits=4).
         pool_b_centroids: torch.Tensor,
+        pool_b_mse_bits: int,
+        pool_b_mse_bytes: int,
+        pool_b_val_data_bytes: int,
+        pool_b_value_quant_bits: int,
+        pool_b_key_fp8: bool,
+        pool_b_norm_correction: bool,
     ) -> torch.Tensor:
-        """Phase 1E: continuation prefill over two TQ pools. **Stub.**
+        """Phase 1E: continuation prefill over two TQ pools.
 
         Mirrors `_continuation_prefill` but reads cached K/V from two
-        physical pools (pool A = TQ84 prefix, pool B = TQ44 dialogue).
-        The implementation strategy when this lands:
+        physical pools (pool A = prefix tier; pool B = dialogue tier),
+        each with its own TQ codec. The output is assembled as
 
-          1. Dequant `pool_a_cached_len` tokens from `pool_a_kv_cache`
-             using the TQ84 layout (this layer's `key_fp8=True`).
-          2. Dequant `pool_b_cached_len` tokens from `pool_b_kv_cache`
-             using the TQ44 layout (this layer's `key_fp8=False`,
-             different `mse_bytes`, different `key_data_bytes`).
-          3. Inverse-rotate each (Pi rotations can differ per pool —
-             pass `pool_a_Pi` / `pool_b_Pi`).
-          4. Stack into k_full / v_full as
-                  [pool_a_dequant; pool_b_dequant; chunk_raw]
-             with size `pool_a_cached_len + pool_b_cached_len + q_len ==
-             seq_len`.
-          5. Run flash_attn_varlen_func over the merged tensors with
-             the existing causal mask logic.
+            [pool_a_dequant_K; pool_b_dequant_K; chunk_raw_K]
 
-        Status: **scaffold only**. The dequant kernel
-        (`_tq_full_dequant_kv`) is parameterised by per-tier layout
-        constants, so step 1+2 require two separate launches with
-        different MSE_BYTES / KEY_FP8 / etc. constants — straightforward
-        but ~150 LOC of careful plumbing. Implementing this in lock-step
-        with `phase1e_split_kernel` lets us validate end-to-end.
+        and analogously for V, then attended via the standard
+        flash_attn_varlen_func causal kernel.
 
-        Until both this method and the v3_split kernel are implemented,
-        the prefill-tier path is non-functional (env flag stays off).
+        Per-pool codec assumptions match the prefix-tier plan:
+          * Pool A (prefix): typically TQ84_nc — key_fp8=True, val_q=4.
+          * Pool B (dialogue): typically TQ44_nc — key_fp8=False, val_q=4.
+
+        The Pi/VRot inverse-rotation matrices are layer-level (derived
+        from the Hadamard for ``head_dim``), so both pools share
+        ``layer._tq_Pi_half`` (used only for MSE keys) and
+        ``layer._tq_VRot_half`` (V inverse rotation when V was stored
+        rotated). FP8 keys bypass K inverse rotation entirely.
+
+        Algebraic correctness: this method produces a numerically
+        equivalent attention output to running the v3_split decode
+        kernel on the same data, modulo the dequant→fp16→flash_attn
+        round-trip vs in-place TQ attention. We only invoke it for
+        prefill (q_len > 1); decode goes through the v3_split kernel.
         """
         if pool_a_cached_len + pool_b_cached_len + key_chunk.shape[0] != seq_len:
             raise ValueError(
@@ -882,12 +1025,145 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 f"pool_b_cached_len={pool_b_cached_len} + "
                 f"q_len={key_chunk.shape[0]} != seq_len={seq_len}"
             )
-        raise NotImplementedError(
-            "_continuation_prefill_split is the API contract for Phase 1E "
-            "two-pool continuation prefill. The implementation needs the "
-            "v3_split kernel (or its fallback) to land first. Do not enable "
-            "VLLM_TQ_PREFIX_TIER until both have been implemented."
+
+        q_len, Hq, D = query.shape
+        Hk = key_chunk.shape[1]
+        device = query.device
+        # Both pools must share block_size and Hk (validated in the kernel
+        # launcher; we re-check here for the dequant-grid sizing).
+        block_size = pool_a_kv_cache.shape[1]
+        if block_size != pool_b_kv_cache.shape[1]:
+            raise ValueError(
+                f"pool A/B block_size mismatch: A={block_size} "
+                f"B={pool_b_kv_cache.shape[1]}"
+            )
+        BLOCK_D = triton.next_power_of_2(D)
+        device_index = device.index or 0
+
+        # ----- Allocate dequant workspace for BOTH pools in one call. -----
+        # `WorkspaceManager.get_simultaneous` packs all returned views into
+        # a single contiguous buffer; calling it twice would re-use the same
+        # bytes and clobber pool-A while we dequant pool-B. So we allocate
+        # all four (k_a, v_a, k_b, v_b) up front.
+        pool_a_alloc_len = math.ceil(max(pool_a_cached_len, 1) / block_size) * block_size
+        pool_b_alloc_len = math.ceil(max(pool_b_cached_len, 1) / block_size) * block_size
+
+        ws = current_workspace_manager()
+        k_buf_a, v_buf_a, k_buf_b, v_buf_b = ws.get_simultaneous(
+            ((1, Hk, pool_a_alloc_len, D), torch.float16),
+            ((1, Hk, pool_a_alloc_len, D), torch.float16),
+            ((1, Hk, pool_b_alloc_len, D), torch.float16),
+            ((1, Hk, pool_b_alloc_len, D), torch.float16),
         )
+
+        if pool_a_cached_len > 0:
+            k_a, v_a = self._dequant_pool_into_buf(
+                pool_a_kv_cache,
+                pool_a_block_table,
+                pool_a_centroids,
+                pool_a_cached_len,
+                Hk, D, block_size, BLOCK_D,
+                pool_a_mse_bits, pool_a_mse_bytes,
+                pool_a_val_data_bytes, pool_a_value_quant_bits,
+                pool_a_key_fp8, pool_a_norm_correction,
+                k_buf_a, v_buf_a, device_index,
+            )
+        else:
+            k_a = v_a = None
+
+        if pool_b_cached_len > 0:
+            k_b, v_b = self._dequant_pool_into_buf(
+                pool_b_kv_cache,
+                pool_b_block_table,
+                pool_b_centroids,
+                pool_b_cached_len,
+                Hk, D, block_size, BLOCK_D,
+                pool_b_mse_bits, pool_b_mse_bytes,
+                pool_b_val_data_bytes, pool_b_value_quant_bits,
+                pool_b_key_fp8, pool_b_norm_correction,
+                k_buf_b, v_buf_b, device_index,
+            )
+        else:
+            k_b = v_b = None
+
+        # ----- Inverse rotations per pool (matches _continuation_prefill). -----
+        # K inverse rotation is needed only for MSE-key pools; FP8 pools
+        # store keys in original space already.
+        Pi_half = layer._tq_Pi_half  # may be None; only used when MSE key
+        v_inv_rot = layer._tq_VRot_half  # may be None; used when V was rotated
+
+        def _post_dequant_inverse(k_cached, v_cached, cached_len, key_fp8):
+            if cached_len == 0:
+                return None, None
+            # K
+            if key_fp8 or Pi_half is None:
+                k_trim = k_cached[0, :, :cached_len, :].transpose(0, 1)
+            else:
+                k_flat = k_cached[0, :, :cached_len, :].reshape(-1, D)
+                k_flat = k_flat @ Pi_half
+                k_trim = k_flat.reshape(Hk, cached_len, D).transpose(0, 1)
+            # V
+            if v_inv_rot is not None:
+                v_flat = v_cached[0, :, :cached_len, :].reshape(-1, D) @ v_inv_rot
+                v_trim = v_flat.reshape(Hk, cached_len, D).transpose(0, 1)
+            else:
+                v_trim = v_cached[0, :, :cached_len, :].transpose(0, 1)
+            return k_trim, v_trim
+
+        k_a_trim, v_a_trim = _post_dequant_inverse(
+            k_a, v_a, pool_a_cached_len, pool_a_key_fp8,
+        )
+        k_b_trim, v_b_trim = _post_dequant_inverse(
+            k_b, v_b, pool_b_cached_len, pool_b_key_fp8,
+        )
+
+        # ----- Concatenate [pool_a, pool_b, chunk] into k_full / v_full. -----
+        qdtype = query.dtype
+        k_full = torch.empty(seq_len, Hk, D, dtype=qdtype, device=device)
+        v_full = torch.empty(seq_len, Hk, D, dtype=qdtype, device=device)
+        offset = 0
+        if k_a_trim is not None:
+            k_full[offset : offset + pool_a_cached_len] = k_a_trim.to(qdtype)
+            v_full[offset : offset + pool_a_cached_len] = v_a_trim.to(qdtype)
+            offset += pool_a_cached_len
+        if k_b_trim is not None:
+            k_full[offset : offset + pool_b_cached_len] = k_b_trim.to(qdtype)
+            v_full[offset : offset + pool_b_cached_len] = v_b_trim.to(qdtype)
+            offset += pool_b_cached_len
+        # Current chunk (always present for a continuation call).
+        k_full[offset:] = key_chunk
+        v_full[offset:] = val_chunk
+        cached_len_total = pool_a_cached_len + pool_b_cached_len
+
+        # ----- flash_attn_varlen / SDPA fallback (identical to single-pool). -----
+        if _HAS_FLASH_ATTN:
+            cu_seqlens_q = torch.tensor([0, q_len], device=device, dtype=torch.int32)
+            cu_seqlens_k = torch.tensor([0, seq_len], device=device, dtype=torch.int32)
+            return flash_attn_varlen_func(
+                q=query,
+                k=k_full,
+                v=v_full,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=q_len,
+                max_seqlen_k=seq_len,
+                softmax_scale=self.scale,
+                causal=True,
+            )
+        else:
+            q_t = query.transpose(0, 1).unsqueeze(0)
+            k_t = k_full.transpose(0, 1).unsqueeze(0)
+            v_t = v_full.transpose(0, 1).unsqueeze(0)
+            q_pos = torch.arange(q_len, device=device).unsqueeze(1) + cached_len_total
+            k_pos = torch.arange(seq_len, device=device).unsqueeze(0)
+            mask = k_pos <= q_pos
+            out = F.scaled_dot_product_attention(
+                q_t, k_t, v_t,
+                attn_mask=mask,
+                scale=self.scale,
+                enable_gqa=(Hk < Hq),
+            )
+            return out[0].transpose(0, 1)
 
     def _continuation_prefill(
         self,
@@ -1155,3 +1431,88 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 sinks=self.sinks,
             )
         return result
+
+    def _decode_attention_split(
+        self,
+        query: torch.Tensor,  # (B, Hq, D) — one query per seq for pure decode
+        attn_metadata: TurboQuantMetadata,
+        Pi: torch.Tensor,
+        centroids: torch.Tensor,
+        PiT: torch.Tensor | None,
+        layer: torch.nn.Module,
+    ) -> torch.Tensor:
+        """Phase 1E two-pool decode dispatch.
+
+        Adapts the decode-style ``(B, Hq, D)`` query to the unified
+        ``triton_turboquant_unified_attention_split`` signature (which
+        expects ``(num_tokens, Hq, D)`` plus a ``query_start_loc``). For
+        pure decode, num_tokens == B and ``query_start_loc[i] == i``.
+
+        Codec: pool A and pool B share ``self.tq_config`` in this MVP.
+        Codec-mixing (pool A = TQ84, pool B = TQ44) requires per-pool
+        ``tq_config`` plumbing that's tracked separately.
+        """
+        from vllm.v1.attention.ops.triton_turboquant_unified_attention import (
+            triton_turboquant_unified_attention_split,
+        )
+
+        B = query.shape[0]
+        device = query.device
+        # Build query_start_loc = [0, 1, 2, ..., B] for one-token-per-seq.
+        # Re-use attn_metadata.query_start_loc when it already matches
+        # (the runner passes a CPU-side prefix-sum that's correct for
+        # decode); allocate fresh otherwise.
+        qsl = attn_metadata.query_start_loc
+        if qsl is None or qsl.shape[0] != B + 1:
+            qsl = torch.arange(B + 1, device=device, dtype=torch.int32)
+
+        cfg = self.tq_config
+        pool_a_kv = (
+            attn_metadata.pool_a_kv_cache
+            if attn_metadata.pool_a_kv_cache is not None
+            else attn_metadata.pool_b_kv_cache  # fallback: same cache for both pools
+        )
+        pool_b_kv = (
+            attn_metadata.pool_b_kv_cache
+            if attn_metadata.pool_b_kv_cache is not None
+            else pool_a_kv
+        )
+        if pool_a_kv is None or pool_b_kv is None:
+            raise RuntimeError(
+                "two-pool decode requires pool_a_kv_cache and pool_b_kv_cache "
+                "(or one of them) to be set on TurboQuantMetadata; got both None"
+            )
+
+        return triton_turboquant_unified_attention_split(
+            query=query,
+            pool_a_kv_cache=pool_a_kv,
+            pool_b_kv_cache=pool_b_kv,
+            pool_a_block_table=attn_metadata.pool_a_block_table,
+            pool_b_block_table=attn_metadata.pool_b_block_table,
+            pool_a_seq_lens=attn_metadata.pool_a_seq_lens,
+            pool_b_seq_lens=attn_metadata.pool_b_seq_lens,
+            query_start_loc=qsl,
+            pool_a_Pi=Pi,
+            pool_a_centroids=centroids,
+            pool_a_mse_bits=cfg.key_mse_bits,
+            pool_a_key_packed_size=cfg.key_packed_size,
+            pool_a_value_quant_bits=cfg.effective_value_quant_bits,
+            pool_a_value_packed_size=cfg.value_packed_size,
+            pool_a_key_fp8=cfg.key_fp8,
+            pool_a_norm_correction=cfg.norm_correction,
+            pool_a_PiT=PiT,
+            pool_b_Pi=Pi,
+            pool_b_centroids=centroids,
+            pool_b_mse_bits=cfg.key_mse_bits,
+            pool_b_key_packed_size=cfg.key_packed_size,
+            pool_b_value_quant_bits=cfg.effective_value_quant_bits,
+            pool_b_value_packed_size=cfg.value_packed_size,
+            pool_b_key_fp8=cfg.key_fp8,
+            pool_b_norm_correction=cfg.norm_correction,
+            pool_b_PiT=PiT,
+            scale=self.scale,
+            max_query_len=1,
+            max_pool_a_seq_len=attn_metadata.max_pool_a_seq_len or None,
+            max_pool_b_seq_len=attn_metadata.max_pool_b_seq_len or None,
+            sinks=self.sinks,
+        )

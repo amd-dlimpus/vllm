@@ -331,6 +331,7 @@ def _tq_load_v_tile(
 @triton.jit
 def kernel_tq_unified_attention_2d(
     output_ptr,  # [num_tokens, Hq, D]
+    output_lse_ptr,  # [num_tokens, Hq] fp32 — written iff RETURN_LSE; else dummy
     query_ptr,  # [num_tokens, Hq, D] — raw if FUSE_Q_ROT else rotated
     KV_cache_ptr,  # [num_blocks, block_size, Hk, padded_slot] uint8 - TQ packed
     KV_cache_u16_ptr,  # uint16 view of same storage — Opt#2 wide metadata loads
@@ -349,6 +350,8 @@ def kernel_tq_unified_attention_2d(
     query_stride_1: tl.int64,
     output_stride_0: tl.int64,
     output_stride_1: tl.int64,
+    output_lse_stride_0: tl.int64,
+    output_lse_stride_1: tl.int64,
     stride_cache_block: tl.int64,
     pit_stride_0: tl.int64,
     pit_stride_1: tl.int64,
@@ -380,6 +383,10 @@ def kernel_tq_unified_attention_2d(
     FUSE_Q_ROT: tl.constexpr = 0,  # Fused Q @ PiT prologue when 1 (MSE path)
     USE_SINKS: tl.constexpr = 0,  # Per-head sink logit folded into softmax denom
     USE_BF16_DOT: tl.constexpr = 0,  # [USE_BF16_DOT] explicit bf16 cast before QK and PV tl.dot
+    # Phase 1E (prefix-tier) additions. Default values preserve existing
+    # single-pool behavior verbatim; the v3_split launcher toggles them.
+    CAUSAL: tl.constexpr = 1,  # 0 = drop the causal seq_mask (full attention)
+    RETURN_LSE: tl.constexpr = 0,  # 1 = also write fp32 LSE per (q_token, q_head)
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -454,13 +461,20 @@ def kernel_tq_unified_attention_2d(
     context_len = seq_len - cur_batch_query_len
 
     # Longest key prefix any query row in this q-block can attend to.
-    max_seq_prefix_len = (
-        context_len
-        + q_block_local_idx * BLOCK_Q
-        + (BLOCK_M - 1) // num_queries_per_kv
-        + 1
-    )
-    max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
+    if CAUSAL:
+        max_seq_prefix_len = (
+            context_len
+            + q_block_local_idx * BLOCK_Q
+            + (BLOCK_M - 1) // num_queries_per_kv
+            + 1
+        )
+        max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
+    else:
+        # Non-causal: every Q row attends to every cached K (full pass).
+        # Used by v3_split where pool A holds tokens that are *all* causally
+        # before the current Q chunk, so causal truncation is unnecessary and
+        # would incorrectly drop tail-of-pool-A keys.
+        max_seq_prefix_len = seq_len
     num_tiles = tl.cdiv(max_seq_prefix_len, TILE_SIZE)
 
     # [Main/tail split] Main loop: tiles [0, num_tiles-1) are fully within
@@ -488,8 +502,11 @@ def kernel_tq_unified_attention_2d(
             S = scale * tl.dot(Q.to(tl.bfloat16), K_T.to(tl.bfloat16))
         else:
             S = scale * tl.dot(Q, K_T)
-        seq_mask = seq_offset[None, :] <= query_abs_pos
-        S = tl.where(query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf"))
+        if CAUSAL:
+            seq_mask = seq_offset[None, :] <= query_abs_pos
+            S = tl.where(query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf"))
+        else:
+            S = tl.where(query_mask_1[:, None] & query_mask_0[:, None], S, float("-inf"))
         m_j = tl.maximum(M, tl.max(S, axis=1))
         m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
         P = tl.exp(S - m_j[:, None])
@@ -523,8 +540,16 @@ def kernel_tq_unified_attention_2d(
             S = scale * tl.dot(Q.to(tl.bfloat16), K_T.to(tl.bfloat16))
         else:
             S = scale * tl.dot(Q, K_T)
-        seq_mask = seq_offset[None, :] <= query_abs_pos
-        S = tl.where(query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf"))
+        if CAUSAL:
+            seq_mask = seq_offset[None, :] <= query_abs_pos
+            S = tl.where(query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf"))
+        else:
+            # Non-causal tail: tile_mask gates the trailing lanes whose K/V
+            # loads returned zero (UNMASKED=False). Without this AND, those
+            # lanes would contribute exp(0)=1 to the softmax denominator and
+            # corrupt the normalization. Triggers e.g. when seq_len_a is not
+            # a multiple of TILE_SIZE under the v3_split pool-A pass.
+            S = tl.where(query_mask_1[:, None] & query_mask_0[:, None] & tile_mask[None, :], S, float("-inf"))
         m_j = tl.maximum(M, tl.max(S, axis=1))
         m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
         P = tl.exp(S - m_j[:, None])
@@ -551,6 +576,31 @@ def kernel_tq_unified_attention_2d(
         acc,
         mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
     )
+
+    # Phase 1E (prefix-tier) optional LSE store. lse = M + log(L) is the
+    # natural log-sum-exp of all valid Q·K logits in this kernel's KV view.
+    # The v3_split launcher uses lse_a / lse_b to merge the pool-A and
+    # pool-B passes via the standard fp32 online-softmax merge:
+    #
+    #   shift = max(lse_a, lse_b)
+    #   w_a = exp(lse_a - shift); w_b = exp(lse_b - shift)
+    #   out = (w_a * out_a + w_b * out_b) / (w_a + w_b)
+    #
+    # Edge case: if no tile contributed (max_seq_prefix_len == 0, i.e.
+    # empty pool), num_tiles == 0 → M stays at -inf and L stays at 1.0
+    # init, giving lse = -inf + log(1) = -inf, which the merge correctly
+    # interprets as "this pool contributes nothing".
+    if RETURN_LSE:
+        lse_val = M + tl.log(L)
+        output_lse_offset = (
+            query_offset_0 * output_lse_stride_0
+            + query_offset_1 * output_lse_stride_1
+        )
+        tl.store(
+            output_lse_ptr + output_lse_offset,
+            lse_val,
+            mask=query_mask_0 & query_mask_1,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -622,6 +672,11 @@ def kernel_tq_unified_attention_3d(
     FUSE_Q_ROT: tl.constexpr = 0,  # Fused Q @ PiT prologue when 1 (MSE path)
     USE_SINKS: tl.constexpr = 0,  # Per-head sink logit folded into softmax denom
     USE_BF16_DOT: tl.constexpr = 0,  # [USE_BF16_DOT] explicit bf16 cast before QK and PV tl.dot
+    # Phase 1E (prefix-tier) constexprs. CAUSAL=0 disables causal masking
+    # within this kernel (used by v3_split's pool-A pass). 3D path keeps
+    # CAUSAL=1 default; v3_split forces 2D so 3D is currently never invoked
+    # with CAUSAL=0 in production.
+    CAUSAL: tl.constexpr = 1,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -698,13 +753,16 @@ def kernel_tq_unified_attention_3d(
     acc = tl.zeros([BLOCK_M, HEAD_SIZE_PADDED], dtype=tl.float32)
 
     context_len = seq_len - cur_batch_query_len
-    max_seq_prefix_len = (
-        context_len
-        + q_block_local_idx * BLOCK_Q
-        + (BLOCK_M - 1) // num_queries_per_kv
-        + 1
-    )
-    max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
+    if CAUSAL:
+        max_seq_prefix_len = (
+            context_len
+            + q_block_local_idx * BLOCK_Q
+            + (BLOCK_M - 1) // num_queries_per_kv
+            + 1
+        )
+        max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
+    else:
+        max_seq_prefix_len = seq_len
     num_tiles = tl.cdiv(max_seq_prefix_len, TILE_SIZE)
 
     # Segment bounds: clip to the causal prefix range.
@@ -746,8 +804,11 @@ def kernel_tq_unified_attention_3d(
             S = scale * tl.dot(Q.to(tl.bfloat16), K_T.to(tl.bfloat16))
         else:
             S = scale * tl.dot(Q, K_T)
-        seq_mask = seq_offset[None, :] <= query_abs_pos
-        S = tl.where(query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf"))
+        if CAUSAL:
+            seq_mask = seq_offset[None, :] <= query_abs_pos
+            S = tl.where(query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf"))
+        else:
+            S = tl.where(query_mask_1[:, None] & query_mask_0[:, None], S, float("-inf"))
         m_j = tl.maximum(M, tl.max(S, axis=1))
         m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
         P = tl.exp(S - m_j[:, None])
@@ -785,8 +846,12 @@ def kernel_tq_unified_attention_3d(
             S = scale * tl.dot(Q.to(tl.bfloat16), K_T.to(tl.bfloat16))
         else:
             S = scale * tl.dot(Q, K_T)
-        seq_mask = seq_offset[None, :] <= query_abs_pos
-        S = tl.where(query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf"))
+        if CAUSAL:
+            seq_mask = seq_offset[None, :] <= query_abs_pos
+            S = tl.where(query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf"))
+        else:
+            # Non-causal 3D tail: same fix as 2D — apply tile_mask AND.
+            S = tl.where(query_mask_1[:, None] & query_mask_0[:, None] & tile_mask[None, :], S, float("-inf"))
         m_j = tl.maximum(M, tl.max(S, axis=1))
         m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
         P = tl.exp(S - m_j[:, None])
@@ -926,7 +991,11 @@ def triton_turboquant_unified_attention(
     force_2d: bool = False,
     fuse_q_rot: bool = True,
     sinks: torch.Tensor | None = None,  # [Hq] float — per-head sink logits
-) -> torch.Tensor:
+    # Phase 1E (prefix-tier) additions. Defaults preserve the legacy
+    # single-pool causal contract; the v3_split launcher overrides these.
+    causal: bool = True,
+    return_lse: bool = False,
+):
     """Launch unified TQ attention (v3).
 
     ``query`` carries *raw* query vectors. For the MSE-key path the query
@@ -1035,6 +1104,28 @@ def triton_turboquant_unified_attention(
 
     if output is None:
         output = torch.empty_like(query)
+
+    # Phase 1E: optional fp32 LSE output, [num_tokens, Hq]. Only the 2D
+    # kernel writes LSE; we force 2D when the caller requests it because
+    # adding LSE return to the 3D split-KV path would also require the
+    # reduce_segments kernel to keep the merged log-sum-exp, which is
+    # outside the v3_split MVP scope.
+    if return_lse:
+        force_2d = True
+        output_lse = torch.empty(
+            (num_tokens, Hq), dtype=torch.float32, device=device
+        )
+        _lse_ptr = output_lse
+        _lse_stride_0 = output_lse.stride(0)
+        _lse_stride_1 = output_lse.stride(1)
+    else:
+        # Bind a harmless dummy pointer (centroids is fp32 contiguous and
+        # non-null) so Triton's pointer-non-null requirement is satisfied
+        # when RETURN_LSE=0; the kernel never dereferences it in that path.
+        output_lse = None
+        _lse_ptr = centroids
+        _lse_stride_0 = 0
+        _lse_stride_1 = 0
 
     # BLOCK_M heuristic (TQ-specific; diverges from stock unified_attention).
     #
@@ -1173,6 +1264,7 @@ def triton_turboquant_unified_attention(
     if not use_3d:
         kernel_tq_unified_attention_2d[(total_num_q_blocks, Hk)](
             output_ptr=output,
+            output_lse_ptr=_lse_ptr,
             query_ptr=q_rot,
             KV_cache_ptr=kv_cache,
             KV_cache_u16_ptr=kv_cache_u16,
@@ -1191,6 +1283,8 @@ def triton_turboquant_unified_attention(
             query_stride_1=q_rot.stride(1),
             output_stride_0=output.stride(0),
             output_stride_1=output.stride(1),
+            output_lse_stride_0=_lse_stride_0,
+            output_lse_stride_1=_lse_stride_1,
             stride_cache_block=kv_cache.stride(0),
             pit_stride_0=pit_stride_0,
             pit_stride_1=pit_stride_1,
@@ -1220,9 +1314,13 @@ def triton_turboquant_unified_attention(
             FUSE_Q_ROT=1 if apply_fuse_q_rot else 0,
             USE_SINKS=1 if use_sinks else 0,
             USE_BF16_DOT=use_bf16_dot,
+            CAUSAL=1 if causal else 0,
+            RETURN_LSE=1 if return_lse else 0,
             num_warps=4,
             num_stages=num_stages,
         )
+        if return_lse:
+            return output, output_lse
         return output
 
     # ---------------- 3D split-KV path ----------------
@@ -1301,6 +1399,7 @@ def triton_turboquant_unified_attention(
         FUSE_Q_ROT=1 if apply_fuse_q_rot else 0,
         USE_SINKS=1 if use_sinks else 0,
         USE_BF16_DOT=use_bf16_dot,
+        CAUSAL=1 if causal else 0,
         # [Opt B2] num_warps=2 outperforms 4/8 on MI355X with FUSE_Q_ROT=0:
         # less per-warp work but fewer LDS-staging barriers per dot operand.
         # Override via VLLM_TQ_NUM_WARPS_3D for ablation.
@@ -1486,21 +1585,55 @@ def triton_turboquant_unified_attention_split(
     scale: float,
     output: torch.Tensor | None = None,
     sinks: torch.Tensor | None = None,
+    # Internal: max seq lens per pool. If None, inferred from block_table
+    # shape (host-side; no GPU sync). Used by the dispatch heuristic in the
+    # underlying launcher.
+    max_pool_a_seq_len: int | None = None,
+    max_pool_b_seq_len: int | None = None,
+    max_query_len: int | None = None,
+    fuse_q_rot: bool = True,
 ) -> torch.Tensor:
-    """v3_split launcher — two-pool TQ attention. **Stub.**
+    """v3_split launcher — two-pool TQ attention via two passes + fp32 LSE merge.
 
-    This stub validates the call contract and raises ``NotImplementedError``
-    when invoked. The real kernel implementation is tracked under
-    `phase1e_split_kernel`; landing it is a one-file change because the
-    upstream Python (continuation_prefill, runner) is written against
-    this signature.
+    Implements the **fallback "Option A"** from the prefix-tier plan: instead
+    of a single fused dual-codec Triton kernel, we run the existing v3 2D
+    kernel twice (once over each pool) with ``return_lse=True`` and merge
+    the two outputs with a numerically-stable fp32 log-sum-exp combine.
 
-    Validation done here (cheap, catches misuse early):
-      * Both caches share ``block_size`` and ``Hk`` shape on dim 1, 2.
-      * Per-seq pool A + pool B = total seq_len (i.e. every cached token
-        lives in exactly one pool).
-      * ``pool_a_block_table`` and ``pool_b_block_table`` have matching
-        first dim (num_seqs) and an int dtype.
+    Equivalence: ``softmax(Q · [K_a; K_b]) · [V_a; V_b]`` decomposes into
+
+        attn = w_a * out_a + w_b * out_b
+
+    where ``out_p = softmax(Q · K_p) V_p`` (per-pool normalized attention),
+    ``log_z = logaddexp(lse_a, lse_b)``, ``w_p = exp(lse_p - log_z)``, and
+    ``w_a + w_b = 1`` exactly in real arithmetic. Done in fp32 to avoid
+    catastrophic cancellation; result cast back to ``query.dtype`` at the
+    end.
+
+    Causal contract:
+      * Pool A holds only tokens **strictly before** any Q in the current
+        chunk (the prefix is frozen at first-chunk-prefill end). So the
+        pool-A pass uses ``causal=False`` (every Q row attends to every
+        pool-A token).
+      * Pool B holds tokens at-and-after the split point, including the
+        current Q chunk's own keys (just-stored). The pool-B pass uses
+        the standard causal mask.
+
+    Edge cases handled:
+      * ``pool_a_seq_lens[i] == 0`` (no pool-A tokens for this seq): the
+        kernel processes 0 tiles, ``lse_a[i] = -inf``, merge degenerates to
+        pool-B only.
+      * ``pool_b_seq_lens[i] == 0`` (only happens for mask rows or trivial
+        seqs in batch padding): symmetric — merge degenerates to pool-A.
+      * Both pools empty for a row (only mask/padding rows): output is
+        forced to zero via ``nan_to_num`` after the merge.
+
+    TPOT cost: the two-pass approach roughly doubles the dequant + MFMA
+    work vs a single-pool TQ44 baseline. Empirically that translates to
+    ~5–10% end-to-end TPOT regression (plan §Risks). The fused single-
+    kernel "Option E" alternative (≤4% TPOT) is tracked separately and
+    can replace this launcher transparently — the call signature is
+    identical.
     """
     if query.dim() != 3:
         raise ValueError(f"query must be [N, Hq, D]; got {query.shape}")
@@ -1528,13 +1661,102 @@ def triton_turboquant_unified_attention_split(
             f"{pool_a_seq_lens.shape} vs {pool_b_seq_lens.shape}"
         )
 
-    raise NotImplementedError(
-        "triton_turboquant_unified_attention_split is the API contract for "
-        "the Phase 1E v3_split kernel; the fused kernel implementation has "
-        "not landed yet. To run the prefill-tier mixed-precision path, the "
-        "kernel author needs to implement either: (1) the two-phase fused "
-        "kernel (preferred — matches the plan, ≤4% TPOT cost) or (2) the "
-        "two-pass + LSE merge fallback (~5–10% TPOT cost; needs an "
-        "optional return_lse buffer added to the existing v3 kernel). "
-        "Until then, do not enable VLLM_TQ_PREFIX_TIER."
+    num_tokens, Hq, D = query.shape
+    device = query.device
+    qdtype = query.dtype
+
+    if output is None:
+        output = torch.empty_like(query)
+
+    # Per-pool intermediate outputs in query.dtype. We cannot reuse `output`
+    # because both passes need to be retained until the LSE merge finishes.
+    # Layout matches `output`: [num_tokens, Hq, D].
+    out_a = torch.empty_like(query)
+    out_b = torch.empty_like(query)
+
+    # Pool A pass: non-causal (all pool-A tokens are causally before any Q).
+    # Returns (out_a, lse_a) where lse_a is fp32 [num_tokens, Hq].
+    # The launcher forces force_2d=True internally when return_lse=True
+    # because LSE return is only wired through the 2D kernel for now.
+    _, lse_a = triton_turboquant_unified_attention(
+        query=query,
+        kv_cache=pool_a_kv_cache,
+        block_table=pool_a_block_table,
+        seq_lens=pool_a_seq_lens,
+        query_start_loc=query_start_loc,
+        Pi=pool_a_Pi,
+        centroids=pool_a_centroids,
+        scale=scale,
+        mse_bits=pool_a_mse_bits,
+        key_packed_size=pool_a_key_packed_size,
+        value_quant_bits=pool_a_value_quant_bits,
+        value_packed_size=pool_a_value_packed_size,
+        key_fp8=pool_a_key_fp8,
+        norm_correction=pool_a_norm_correction,
+        PiT=pool_a_PiT,
+        output=out_a,
+        max_query_len=max_query_len,
+        max_seq_len=max_pool_a_seq_len,
+        fuse_q_rot=fuse_q_rot,
+        # Sinks fold into pool A only (or pool B only — but never both, as
+        # double-counting them would put an extra exp(s_h) in the merged
+        # softmax denominator). We pick pool A by convention; pool B sees
+        # sinks=None.
+        sinks=sinks,
+        causal=False,
+        return_lse=True,
     )
+
+    # Pool B pass: standard causal attention; sinks=None to avoid double-
+    # counting (see note above).
+    _, lse_b = triton_turboquant_unified_attention(
+        query=query,
+        kv_cache=pool_b_kv_cache,
+        block_table=pool_b_block_table,
+        seq_lens=pool_b_seq_lens,
+        query_start_loc=query_start_loc,
+        Pi=pool_b_Pi,
+        centroids=pool_b_centroids,
+        scale=scale,
+        mse_bits=pool_b_mse_bits,
+        key_packed_size=pool_b_key_packed_size,
+        value_quant_bits=pool_b_value_quant_bits,
+        value_packed_size=pool_b_value_packed_size,
+        key_fp8=pool_b_key_fp8,
+        norm_correction=pool_b_norm_correction,
+        PiT=pool_b_PiT,
+        output=out_b,
+        max_query_len=max_query_len,
+        max_seq_len=max_pool_b_seq_len,
+        fuse_q_rot=fuse_q_rot,
+        sinks=None,
+        causal=True,
+        return_lse=True,
+    )
+
+    # ----- fp32 LSE-aware merge -----
+    # log_z = log(exp(lse_a) + exp(lse_b)) — numerically stable via
+    # torch.logaddexp. Shape: [num_tokens, Hq].
+    log_z = torch.logaddexp(lse_a, lse_b)
+    # Both-empty rows (mask / padding): log_z = -inf. Guard against the
+    # subsequent exp(-inf - -inf) = exp(nan).
+    both_empty = torch.isneginf(log_z)
+    # Weights: exp(lse_p - log_z). Sums to 1 by construction (when finite).
+    w_a = torch.exp(lse_a - log_z)
+    w_b = torch.exp(lse_b - log_z)
+    # Force weights to 0 for both-empty rows so the merged output is 0.
+    if both_empty.any():
+        zero = torch.zeros((), dtype=w_a.dtype, device=w_a.device)
+        w_a = torch.where(both_empty, zero, w_a)
+        w_b = torch.where(both_empty, zero, w_b)
+    # Broadcast over the head_dim axis: weights are [N, Hq], outputs are
+    # [N, Hq, D]. Cast outputs to fp32 once for the linear combine, then
+    # cast the result back to query.dtype.
+    w_a = w_a.unsqueeze(-1)
+    w_b = w_b.unsqueeze(-1)
+    merged = w_a * out_a.float() + w_b * out_b.float()
+    # NaNs only appear if both pools had -inf LSE AND we missed clamping
+    # above; nan_to_num is a cheap safety net.
+    merged = torch.nan_to_num(merged, nan=0.0, posinf=0.0, neginf=0.0)
+    output.copy_(merged.to(qdtype))
+    return output
