@@ -157,11 +157,14 @@ def _tq_decode_stage1_v2(
             mse_bit_shift = mse_bit_off % 8
             mse_mask_val = (1 << MSE_BITS) - 1
 
-    # Loop-invariant bit-extraction for 3-bit values
+    # Loop-invariant bit-extraction for 3-bit/2-bit values
     if VQB == 3:
         val_bit_off = d_offs * 3
         val_byte_idx = val_bit_off // 8
         val_bit_shift = val_bit_off % 8
+    elif VQB == 2:
+        val_byte_idx = d_offs // 4
+        val_bit_shift = (d_offs % 4) * 2
 
     # exp2 pre-scaling
     RCP_LN2: tl.constexpr = 1.4426950408889634
@@ -368,6 +371,15 @@ def _tq_decode_stage1_v2(
             ).to(tl.int32)
             raw16 = val_raw0 | (val_raw1 << 8)
             v_idx = ((raw16 >> val_bit_shift[None, :]) & 0x7).to(tl.float32)
+        elif VQB == 2:
+            val_addrs = val_bases[:, None] + val_byte_idx[None, :]
+            val_raw = tl.load(
+                KV_cache_ptr + val_addrs,
+                mask=kv_mask_1d[:, None] & d_mask[None, :],
+                other=0,
+            ).to(tl.int32)
+            v_idx = ((val_raw >> val_bit_shift[None, :]) & 0x3).to(tl.float32)
+
         else:  # VQB == 4
             # OPT#3 (load-halving, value path): same pattern as OPT#1 for
             # keys -- load each byte exactly once as [TILE_SIZE, HALF_D],

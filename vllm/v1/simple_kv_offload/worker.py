@@ -62,6 +62,9 @@ class SimpleCPUOffloadWorker:
         self._pending_store_event_indices: set[int] = set()
         # Completed store events to report via build_connector_worker_meta
         self._completed_store_events: dict[int, int] = {}
+        # Completed load events with NO req_ids (RAPP prefetch loads).
+        # Demand loads (with req_ids) continue to report via finished_recving.
+        self._completed_load_events_no_req: dict[int, int] = {}
 
     def register_kv_caches(
         self,
@@ -249,6 +252,12 @@ class SimpleCPUOffloadWorker:
                 )
                 if req_ids:
                     finished_recving.update(req_ids)
+                else:
+                    # No waiting requests => RAPP prefetch event. Report
+                    # completion to the scheduler via worker metadata so it
+                    # can promote the freshly-loaded blocks into the GPU
+                    # prefix cache.
+                    self._completed_load_events_no_req[j] = 1
 
         if self._pending_store_event_indices:
             store_wm = self._poll_stream_events(is_store=True)
@@ -259,13 +268,16 @@ class SimpleCPUOffloadWorker:
         return None, finished_recving or None
 
     def build_connector_worker_meta(self) -> SimpleCPUOffloadWorkerMetadata | None:
-        """Return completed store events since the last call."""
-        if not self._completed_store_events:
+        """Return completed store events (and prefetch-load events) since
+        the last call."""
+        if not self._completed_store_events and not self._completed_load_events_no_req:
             return None
         meta = SimpleCPUOffloadWorkerMetadata(
             completed_store_events=self._completed_store_events,
+            completed_load_events=self._completed_load_events_no_req,
         )
         self._completed_store_events = {}
+        self._completed_load_events_no_req = {}
         return meta
 
     def handle_preemptions(

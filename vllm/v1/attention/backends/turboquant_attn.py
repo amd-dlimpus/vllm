@@ -125,6 +125,7 @@ class TurboQuantAttentionBackend(AttentionBackend):
         "turboquant_4bit_nc",
         "turboquant_k3v4_nc",
         "turboquant_3bit_nc",
+        "turboquant_k4v2_nc",
     ]
 
     @staticmethod
@@ -325,7 +326,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # Note: sinks is passed directly via **extra_impl_args spread, not nested.
         self.sinks = kwargs.get("sinks")
 
-    def _ensure_on_device(self, layer, device):
+    def _ensure_on_device(self, layer, device, q_dtype: torch.dtype | None = None):
         """One-time derivation of TQ buffers (rotation matrix, midpoints).
 
         The Hadamard rotation is shared across all layers: random sign
@@ -343,6 +344,27 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             layer._tq_Pi = H
             # fp16 copy for rotation in continuation prefill path
             layer._tq_Pi_half = H.to(torch.float16)
+
+            # k4v2 (and any future ≤2-bit value preset): rotate values before
+            # uniform quantization to spread quantization error across
+            # coordinates. Reuses the same Hadamard since H = H^T = H^{-1};
+            # caller applies the inverse on the attention output.
+            #
+            # Cache an extra runtime-dtype copy (`_tq_VRot_q`) so the
+            # post-attention inverse GEMM avoids mixed-precision matmul
+            # when the model runs in bf16. Defaulted to fp16 if q_dtype
+            # isn't known yet — refreshed lazily on the first forward.
+            if self.tq_config.value_quant_bits == 2:
+                layer._tq_VRot = H
+                layer._tq_VRot_half = layer._tq_Pi_half
+                _qd = q_dtype if q_dtype is not None else torch.float16
+                layer._tq_VRot_q = H.to(_qd)
+                layer._tq_VRot_q_dtype = _qd
+            else:
+                layer._tq_VRot = None
+                layer._tq_VRot_half = None
+                layer._tq_VRot_q = None
+                layer._tq_VRot_q_dtype = None
 
             # Centroids for Lloyd-Max quantization.
             layer._tq_centroids = get_centroids(D, self.tq_config.centroid_bits).to(
@@ -414,7 +436,16 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # Use Any-typed alias for dynamic _tq_* attrs set by _ensure_on_device.
         tq_layer: Any = layer
         device = q.device
-        self._ensure_on_device(tq_layer, device)
+        self._ensure_on_device(tq_layer, device, q.dtype)
+        # Lazy refresh: if model dtype differs from the cached one (e.g. first
+        # call was during _store_kv with key.dtype, now we have q.dtype),
+        # rebuild the runtime-dtype rotation. One-time per layer.
+        if (
+            tq_layer._tq_VRot is not None
+            and tq_layer._tq_VRot_q_dtype != q.dtype
+        ):
+            tq_layer._tq_VRot_q = tq_layer._tq_VRot.to(q.dtype)
+            tq_layer._tq_VRot_q_dtype = q.dtype
         Pi = tq_layer._tq_Pi
         PiT = tq_layer._tq_PiT
         centroids = tq_layer._tq_centroids
@@ -425,11 +456,26 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         num_decodes = attn_metadata.num_decodes
         num_decode_tokens = attn_metadata.num_decode_tokens
 
+        # k4v2: values are stored in cache pre-rotated by H_v. The decode/
+        # unified kernels return attention output in *rotated value space*
+        # (output = softmax(QK^T) @ (V_orig @ H_v) = (orig_output) @ H_v).
+        # We invert with one GEMM after attention. Continuation-prefill
+        # handles its own inverse internally (cached V is rotated back
+        # before flash_attn) so its output is already in original space.
+        # `_tq_VRot_q` is pre-cast to q.dtype to keep this matmul on a
+        # single precision (avoids mixed fp16/bf16 matmul + extra .to() in
+        # the CUDA-graph-captured region).
+        v_inv_rot = tq_layer._tq_VRot_q  # None when value_quant_bits != 2
+
         if not attn_metadata.is_prefill:
             # Pure decode batch — fast path
             attn_out = self._decode_attention(
                 q, kv_cache, attn_metadata, Pi, centroids, PiT, layer
             )
+            if v_inv_rot is not None:
+                attn_out = (attn_out.reshape(-1, self.head_size) @ v_inv_rot).reshape(
+                    attn_out.shape
+                )
         elif num_decodes == 0:
             # Pure prefill batch
             k = key[:N].view(N, self.num_kv_heads, self.head_size)
@@ -463,9 +509,14 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 max_seq_len=attn_metadata.max_seq_len,
                 is_prefill=False,
             )
-            attn_out[:num_decode_tokens] = self._decode_attention(
+            decode_out = self._decode_attention(
                 q[:num_decode_tokens], kv_cache, decode_meta, Pi, centroids, PiT, layer
             )
+            if v_inv_rot is not None:
+                decode_out = (
+                    decode_out.reshape(-1, self.head_size) @ v_inv_rot
+                ).reshape(decode_out.shape)
+            attn_out[:num_decode_tokens] = decode_out
 
             # --- Prefill portion (remaining requests) ---
             # CRITICAL: use prefill-specific max_seq_len so flash_attn's
@@ -535,6 +586,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             key_fp8=self.tq_config.key_fp8,
             centroids=layer._tq_centroids,
             norm_correction=self.tq_config.norm_correction,
+            value_rotation=layer._tq_VRot,
         )
 
     # ------------------------------------------------------------------ #
@@ -775,6 +827,68 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
         return output
 
+    def _continuation_prefill_split(
+        self,
+        layer: Any,
+        query: torch.Tensor,
+        key_chunk: torch.Tensor,
+        val_chunk: torch.Tensor,
+        pool_a_kv_cache: torch.Tensor,
+        pool_b_kv_cache: torch.Tensor,
+        pool_a_block_table: torch.Tensor,
+        pool_b_block_table: torch.Tensor,
+        pool_a_cached_len: int,
+        pool_b_cached_len: int,
+        seq_len: int,
+        pool_a_Pi: torch.Tensor,
+        pool_a_centroids: torch.Tensor,
+        pool_b_Pi: torch.Tensor,
+        pool_b_centroids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Phase 1E: continuation prefill over two TQ pools. **Stub.**
+
+        Mirrors `_continuation_prefill` but reads cached K/V from two
+        physical pools (pool A = TQ84 prefix, pool B = TQ44 dialogue).
+        The implementation strategy when this lands:
+
+          1. Dequant `pool_a_cached_len` tokens from `pool_a_kv_cache`
+             using the TQ84 layout (this layer's `key_fp8=True`).
+          2. Dequant `pool_b_cached_len` tokens from `pool_b_kv_cache`
+             using the TQ44 layout (this layer's `key_fp8=False`,
+             different `mse_bytes`, different `key_data_bytes`).
+          3. Inverse-rotate each (Pi rotations can differ per pool —
+             pass `pool_a_Pi` / `pool_b_Pi`).
+          4. Stack into k_full / v_full as
+                  [pool_a_dequant; pool_b_dequant; chunk_raw]
+             with size `pool_a_cached_len + pool_b_cached_len + q_len ==
+             seq_len`.
+          5. Run flash_attn_varlen_func over the merged tensors with
+             the existing causal mask logic.
+
+        Status: **scaffold only**. The dequant kernel
+        (`_tq_full_dequant_kv`) is parameterised by per-tier layout
+        constants, so step 1+2 require two separate launches with
+        different MSE_BYTES / KEY_FP8 / etc. constants — straightforward
+        but ~150 LOC of careful plumbing. Implementing this in lock-step
+        with `phase1e_split_kernel` lets us validate end-to-end.
+
+        Until both this method and the v3_split kernel are implemented,
+        the prefill-tier path is non-functional (env flag stays off).
+        """
+        if pool_a_cached_len + pool_b_cached_len + key_chunk.shape[0] != seq_len:
+            raise ValueError(
+                f"two-pool seq-length invariant violated: "
+                f"pool_a_cached_len={pool_a_cached_len} + "
+                f"pool_b_cached_len={pool_b_cached_len} + "
+                f"q_len={key_chunk.shape[0]} != seq_len={seq_len}"
+            )
+        raise NotImplementedError(
+            "_continuation_prefill_split is the API contract for Phase 1E "
+            "two-pool continuation prefill. The implementation needs the "
+            "v3_split kernel (or its fallback) to land first. Do not enable "
+            "VLLM_TQ_PREFIX_TIER until both have been implemented."
+        )
+
     def _continuation_prefill(
         self,
         layer: Any,
@@ -880,8 +994,18 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 0, 1
             )  # (cached_len, Hk, D)
 
-        # Skip .contiguous() — the copy into k_full/v_full handles layout
-        v_cached_trim = v_cached[0, :, :cached_len, :].transpose(0, 1)
+        # k4v2: values were stored rotated; inverse-rotate cached V back to
+        # original space so it can be concatenated with the raw current chunk
+        # and consumed by flash_attn directly. Mirrors the K-side pattern
+        # above. Output of this path is in original space → no post-attention
+        # inverse needed in forward().
+        v_inv_rot = layer._tq_VRot_half
+        if v_inv_rot is not None:
+            v_flat = v_cached[0, :, :cached_len, :].reshape(-1, D) @ v_inv_rot
+            v_cached_trim = v_flat.reshape(Hk, cached_len, D).transpose(0, 1)
+        else:
+            # Skip .contiguous() — the copy into k_full/v_full handles layout
+            v_cached_trim = v_cached[0, :, :cached_len, :].transpose(0, 1)
 
         # Concatenate cached + current chunk K/V (match query dtype)
         # Pre-allocate full K/V buffer, copy into slices (no cat alloc)

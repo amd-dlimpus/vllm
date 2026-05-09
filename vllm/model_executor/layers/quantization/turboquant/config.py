@@ -23,6 +23,20 @@ TQ_PRESETS: dict[str, dict] = {
         "value_quant_bits": 4,
         "norm_correction": False,
     },
+    # Phase 1E preset: TQ84 with norm-correction nominally enabled. NC is
+    # effectively a no-op for FP8 keys — the K-norm folding it implements
+    # only applies to MSE-quantized keys (see the FP8 short-circuit in
+    # triton_turboquant_store._tq_fused_store_mse). The preset exists for
+    # symmetry with turboquant_4bit_nc so that mixed-precision pool configs
+    # have parallel naming. Slot size and runtime behaviour are identical
+    # to turboquant_k8v4. Kept as a separate name so a future change that
+    # makes NC meaningful for FP8 keys (e.g. value-side norm correction)
+    # can opt into it via this preset without touching turboquant_k8v4.
+    "turboquant_k8v4_nc": {
+        "key_quant_bits": 8,
+        "value_quant_bits": 4,
+        "norm_correction": True,
+    },
     "turboquant_4bit_nc": {
         "key_quant_bits": 4,
         "value_quant_bits": 4,
@@ -36,6 +50,11 @@ TQ_PRESETS: dict[str, dict] = {
     "turboquant_3bit_nc": {
         "key_quant_bits": 3,
         "value_quant_bits": 3,
+        "norm_correction": True,
+    },
+    "turboquant_k4v2_nc": {
+        "key_quant_bits": 4,
+        "value_quant_bits": 2,
         "norm_correction": True,
     },
 }

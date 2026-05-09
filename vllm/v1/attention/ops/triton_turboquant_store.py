@@ -81,6 +81,23 @@ def _store_quantized_value(
             b2,
             mask=grp_mask,
         )
+    elif VQB == 2:
+        val_vec = tl.load(Value_ptr + base + d_offs, mask=d_mask, other=0.0).to(tl.float32)
+        val_min = tl.min(tl.where(d_mask, val_vec, float("inf")), axis=0)
+        val_max = tl.max(tl.where(d_mask, val_vec, -float("inf")), axis=0)
+        v_scale = (val_max - val_min) / 3.0
+        v_scale = tl.where(v_scale > 1e-8, v_scale, 1e-8)
+
+        q_all = tl.minimum(
+            tl.maximum(((val_vec - val_min) / v_scale + 0.5).to(tl.int32), 0), 3
+        )
+        q_quads = tl.reshape(q_all, [BLOCK_D // 4, 4])
+        shifts_2 = tl.arange(0, 4) * 2
+        packed = tl.sum((q_quads & 0x3) << shifts_2[None, :], axis=1).to(tl.uint8)
+        val_offs = tl.arange(0, BLOCK_D // 4)
+        val_mask = val_offs < VAL_DATA_BYTES
+        tl.store(KV_cache_ptr + data_base + V_DATA_OFFSET + val_offs, packed, mask=val_mask)
+
     else:  # VQB == 4
         val_vec = tl.load(Value_ptr + base + d_offs, mask=d_mask, other=0.0).to(
             tl.float32
@@ -391,6 +408,7 @@ def triton_turboquant_store(
     centroids: torch.Tensor
     | None = None,  # [n_centroids] float32 — required when norm_correction=True
     norm_correction: bool = False,
+    value_rotation: torch.Tensor | None = None,  # [D, D] float32 — optional V rotation
 ):
     """Launch TQ store kernel (FP8 or MSE path).
 
@@ -400,6 +418,13 @@ def triton_turboquant_store(
     load-side attention kernel no longer computes per-tile sum+sqrt+divide,
     saving ~26% of TQ overhead on gpt-oss decode (ctx=4096). ``centroids``
     must be provided in this mode.
+
+    When ``value_rotation`` is provided (currently used by the k4v2 preset to
+    spread quantization error across coordinates), values are pre-multiplied
+    by the rotation matrix before per-token uniform quantization. The kernel
+    itself is unchanged — it quantizes whatever Value_ptr it's given. Callers
+    are responsible for applying the inverse rotation to the attention output
+    on the load side.
     """
     if norm_correction and not key_fp8:
         assert centroids is not None, (
@@ -445,7 +470,14 @@ def triton_turboquant_store(
     # ── FP8 PATH: in-kernel FP8 cast + scatter via fp8 kernel ──
     if key_fp8:
         k_flat = key.reshape(NH, D).contiguous()
-        v_flat = value.reshape(NH, D).contiguous()
+        if value_rotation is not None:
+            # Rotate values pre-quant so quantization error is spread across
+            # coordinates (caller must invert on the load side).
+            v_flat = (
+                value.float().reshape(NH, D) @ value_rotation
+            ).to(value.dtype).contiguous()
+        else:
+            v_flat = value.reshape(NH, D).contiguous()
 
         fp8_e4b15 = _use_fp8_e4b15(key.device.index or 0)
 
@@ -484,6 +516,10 @@ def triton_turboquant_store(
     y = x_hat @ PiT
 
     v_flat = value.float().reshape(NH, D)
+    if value_rotation is not None:
+        # Same invariant as the FP8 path: pre-rotate so per-token uniform
+        # quantization sees a coordinate-spread distribution.
+        v_flat = v_flat @ value_rotation
 
     # When norm_correction=True, the kernel folds 1/||c_t|| into the
     # stored per-token K-norm so the load kernel can skip per-tile norm

@@ -25,9 +25,11 @@ CacheDType = Literal[
     "fp8_inc",
     "fp8_ds_mla",
     "turboquant_k8v4",
+    "turboquant_k8v4_nc",
     "turboquant_4bit_nc",
     "turboquant_k3v4_nc",
     "turboquant_3bit_nc",
+    "turboquant_k4v2_nc",
     "int8_per_token_head",
     "fp8_per_token_head",
     "nvfp4",
@@ -102,6 +104,21 @@ class CacheConfig:
     kv_cache_dtype_skip_layers: list[str] = field(default_factory=list)
     """Layer patterns to skip KV cache quantization. Accepts layer indices
     (e.g., '0', '2', '4') or attention type names (e.g., 'sliding_window')."""
+    kv_cache_dtype_per_layer: dict[str, CacheDType] = field(default_factory=dict)
+    """Per-layer KV cache dtype overrides. Maps layer-index strings to a
+    `CacheDType` (e.g. ``{"0": "turboquant_k8v4", "1": "turboquant_k8v4",
+    "60": "turboquant_k8v4", "61": "turboquant_k8v4"}``). Layers not in the
+    map use the global `cache_dtype`. Used by the prefill-tier mixed-precision
+    KV scheme (Phase 1D): higher-precision codec on selected layers (e.g.
+    boundary layers) while the rest stay at the cheaper global dtype.
+
+    Resolution order at attention construction (see
+    `vllm/model_executor/layers/attention/attention.py`):
+      1. If layer is in `kv_cache_dtype_skip_layers`, dtype = "auto".
+      2. Else if layer index is in `kv_cache_dtype_per_layer`, dtype =
+         that mapping's value.
+      3. Else dtype = global `cache_dtype`.
+    """
     mamba_page_size_padded: int | None = None
     """ Optional override for mamba page size; used by hybrid mamba/attention
     models to ensure exact alignment with attention page size."""

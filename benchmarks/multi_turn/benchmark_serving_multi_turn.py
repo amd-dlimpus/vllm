@@ -82,6 +82,10 @@ class ServerResponse(NamedTuple):
     first_chunk: str  # first chunk of the content
     content: str  # includes the first_chunk
     num_chunks: int
+    # Server-reported usage (requires --enable-prompt-tokens-details on vLLM).
+    # Both default to -1 if the server did not report usage on this response.
+    prompt_tokens: int = -1
+    cached_tokens: int = -1
 
     def __str__(self) -> str:
         return f"ttft_ms {self.ttft_ms:.2f}, tpot_ms {self.tpot_ms:.2f}, latency_ms {self.latency_ms:.2f}"  # noqa: E501
@@ -100,11 +104,20 @@ class RequestStats(NamedTuple):
     approx_cached_percent: float
     conversation_id: str
     client_id: int
+    # 0-indexed user-turn number within the conversation. Round 0 is the first
+    # user turn (cold), round N>0 is the (N+1)-th user turn after N
+    # assistant replies have been added to history.
+    round_index: int = 0
+    # Server-reported counts (require --enable-prompt-tokens-details on vLLM).
+    # -1 means the server did not report usage for this request.
+    server_prompt_tokens: int = -1
+    cached_tokens: int = -1
 
     def __str__(self) -> str:
         return (
             f"ttft_ms {self.ttft_ms:.2f}, tpot_ms {self.tpot_ms:.2f}, latency_ms {self.latency_ms:.2f}, input_num_tokens {self.input_num_tokens}, "  # noqa: E501
             f"output_num_tokens {self.output_num_tokens} ({self.output_num_chunks} chunks, {self.output_num_first_chunk_tokens} tokens in first chunk), "  # noqa: E501
+            f"round={self.round_index}, cached_tokens={self.cached_tokens}, "
             f"approx_cached_percent {self.approx_cached_percent:.2f}%"
         )
 
@@ -227,7 +240,10 @@ async def send_request(
 
     if stream:
         payload["stream"] = True
-        payload["stream_options"] = {"include_usage": False}
+        # include_usage=True asks the server to emit a final SSE chunk containing
+        # token usage including prompt_tokens_details.cached_tokens (vLLM exposes
+        # this when started with --enable-prompt-tokens-details).
+        payload["stream_options"] = {"include_usage": True}
 
     if min_tokens is not None:
         payload["min_tokens"] = min_tokens
@@ -256,6 +272,8 @@ async def send_request(
     latency: float | None = None
     first_chunk = ""
     generated_text = ""
+    prompt_tokens: int = -1
+    cached_tokens: int = -1
 
     start_time: int = time.perf_counter_ns()
     most_recent_timestamp: int = start_time
@@ -279,12 +297,32 @@ async def send_request(
                     message = data["choices"][0]["message"]
                     assert message["role"] == "assistant"
                     generated_text += message["content"]
+                    # Non-streaming usage (if present)
+                    usage = data.get("usage")
+                    if usage:
+                        prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
+                        details = usage.get("prompt_tokens_details") or {}
+                        cached_tokens = details.get("cached_tokens", cached_tokens)
                 else:
                     timestamp: int = time.perf_counter_ns()
                     data = json.loads(chunk)
 
+                    # When include_usage=True, the server emits a terminal chunk
+                    # with empty `choices` and a populated `usage` object.
+                    choices = data.get("choices") or []
+                    if not choices:
+                        usage = data.get("usage")
+                        if usage:
+                            prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
+                            details = usage.get("prompt_tokens_details") or {}
+                            cached_tokens = details.get(
+                                "cached_tokens", cached_tokens
+                            )
+                        most_recent_timestamp = timestamp
+                        continue
+
                     # Delta is the new content/text/data
-                    delta = data["choices"][0]["delta"]
+                    delta = choices[0].get("delta") or {}
                     if delta.get("content", None):
                         if ttft is None:
                             # First token
@@ -296,6 +334,14 @@ async def send_request(
                             chunk_delay.append(timestamp - most_recent_timestamp)
 
                         generated_text += delta["content"]
+
+                    # Some servers attach usage on the same chunk as the final
+                    # delta; capture it opportunistically.
+                    usage = data.get("usage")
+                    if usage:
+                        prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
+                        details = usage.get("prompt_tokens_details") or {}
+                        cached_tokens = details.get("cached_tokens", cached_tokens)
 
                     most_recent_timestamp = timestamp
         else:
@@ -329,6 +375,8 @@ async def send_request(
         first_chunk=first_chunk,
         content=generated_text,
         num_chunks=num_chunks,
+        prompt_tokens=prompt_tokens,
+        cached_tokens=cached_tokens,
     )
     return sr
 
@@ -467,6 +515,11 @@ async def send_turn(
         # First chunk had only one token
         ttft_ms = response.ttft_ms
 
+    # 0-indexed user-turn number. messages_to_use is 1, 3, 5, ... for the
+    # 1st, 2nd, 3rd user turn (each completed turn appends one assistant reply
+    # to history before the next user turn is sent).
+    round_index = (messages_to_use - 1) // 2
+
     rs = RequestStats(
         ttft_ms=ttft_ms,
         tpot_ms=tpot_ms,
@@ -480,6 +533,9 @@ async def send_turn(
         approx_cached_percent=approx_cached_percent,
         conversation_id=conv_id,
         client_id=client_id,
+        round_index=round_index,
+        server_prompt_tokens=response.prompt_tokens,
+        cached_tokens=response.cached_tokens,
     )
 
     if verbose:
@@ -1118,6 +1174,10 @@ def process_statistics(
     pd.set_option("display.precision", 2)
 
     # Exclude parameters from RequestStats
+    # round_index is a discrete bucket key (used for per-round grouping below),
+    # not a metric to average. server_prompt_tokens duplicates input_num_tokens
+    # when the server reports usage; we keep cached_tokens in the summary
+    # only when the server actually reported usage (handled below).
     exclude = [
         "start_time_ms",
         "end_time_ms",
@@ -1125,6 +1185,8 @@ def process_statistics(
         "approx_cached_percent",
         "conversation_id",
         "client_id",
+        "round_index",
+        "server_prompt_tokens",
     ]
 
     print(TEXT_SEPARATOR)
@@ -1151,8 +1213,24 @@ def process_statistics(
 
     print(TEXT_SEPARATOR)
 
+    # Detect whether the server reported usage details (cached_tokens). Server
+    # must be started with --enable-prompt-tokens-details. If not present we
+    # still compute the existing summary, just skip the cache-hit reporting.
+    has_cache_info = (raw_data["cached_tokens"] >= 0).any()
+    if not has_cache_info:
+        logger.warning(
+            "%sNo server-reported cached_tokens were observed. Restart vLLM "
+            "with --enable-prompt-tokens-details to get true cache hit "
+            "rates; per-round cache hit rate will be omitted.%s",
+            Color.YELLOW,
+            Color.RESET,
+        )
+        # Avoid emitting a misleading "cached_tokens mean=-1" row.
+        exclude.append("cached_tokens")
+
     params_list = []
     df_list = []
+    per_round_tables: list[pd.DataFrame] = []
     for percent in warmup_percentages:
         # Select samples from the end (tail) of the dataframe
         warmup_count = int(percent * len(raw_data))
@@ -1178,6 +1256,66 @@ def process_statistics(
             params["warmup_runtime_sec"] = warmup_runtime_sec
             params["total_runtime_incl_warmup_sec"] = runtime_sec + warmup_runtime_sec
 
+        # Overall cache hit rate (server-reported). Computed as
+        # sum(cached_tokens) / sum(server_prompt_tokens) over requests where
+        # the server actually reported usage. This is the headline metric for
+        # KV-cache compression studies.
+        if has_cache_info:
+            cache_df = df[df["cached_tokens"] >= 0]
+            total_prompt = int(cache_df["server_prompt_tokens"].clip(lower=0).sum())
+            total_cached = int(cache_df["cached_tokens"].clip(lower=0).sum())
+            cache_hit_rate = (
+                total_cached / total_prompt if total_prompt > 0 else 0.0
+            )
+            params["cache_hit_rate"] = cache_hit_rate
+            params["total_prompt_tokens"] = total_prompt
+            params["total_cached_tokens"] = total_cached
+            input_tok_per_sec = total_prompt / runtime_sec if runtime_sec > 0 else 0.0
+            params["input_token_throughput"] = input_tok_per_sec
+
+        # Per-round breakdown: count, mean TTFT/TPOT/latency, mean prompt
+        # length, mean cached_tokens, and cache hit rate for each round.
+        # Round 0 is the cold first turn; later rounds should show
+        # progressively higher cache hit rate when prefix caching is healthy.
+        per_round_df: pd.DataFrame | None = None
+        if "round_index" in df.columns and df["round_index"].notna().any():
+            grouped = df.groupby("round_index")
+            per_round = pd.DataFrame(
+                {
+                    "count": grouped.size(),
+                    "ttft_ms_mean": grouped["ttft_ms"].mean(),
+                    "tpot_ms_mean": grouped["tpot_ms"].mean(),
+                    "latency_ms_mean": grouped["latency_ms"].mean(),
+                    "input_tokens_mean": grouped["input_num_tokens"].mean(),
+                    "output_tokens_mean": grouped["output_num_tokens"].mean(),
+                }
+            )
+            if has_cache_info:
+                # Per-round cache hit rate uses server-reported counts.
+                round_prompt_sum = (
+                    grouped.apply(
+                        lambda g: g.loc[g["cached_tokens"] >= 0, "server_prompt_tokens"]
+                        .clip(lower=0)
+                        .sum()
+                    )
+                )
+                round_cached_sum = (
+                    grouped.apply(
+                        lambda g: g.loc[g["cached_tokens"] >= 0, "cached_tokens"]
+                        .clip(lower=0)
+                        .sum()
+                    )
+                )
+                per_round["cached_tokens_sum"] = round_cached_sum.astype(int)
+                per_round["prompt_tokens_sum"] = round_prompt_sum.astype(int)
+                per_round["cache_hit_rate"] = (
+                    round_cached_sum / round_prompt_sum.replace(0, np.nan)
+                ).fillna(0.0)
+            per_round_df = per_round
+            per_round_tables.append(per_round_df)
+        else:
+            per_round_tables.append(pd.DataFrame())
+
         # Generate a summary of relevant metrics (and drop irrelevant data)
         df = df.drop(columns=exclude).describe(percentiles=percentiles).transpose()
 
@@ -1195,13 +1333,20 @@ def process_statistics(
             print(f"{Color.YELLOW}Statistics summary:{Color.RESET}")
 
         for k, v in params.items():
-            if isinstance(v, float):
+            if k == "cache_hit_rate":
+                print(f"{k} = {v:.4f}  ({v * 100:.2f}%)")
+            elif isinstance(v, float):
                 print(f"{k} = {v:.3f}")
             else:
                 print(f"{k} = {v}")
         print(TEXT_SEPARATOR)
         print(df)
         print(TEXT_SEPARATOR)
+
+        if per_round_df is not None and len(per_round_df) > 0:
+            print(f"{Color.YELLOW}Per-round breakdown:{Color.RESET}")
+            print(per_round_df.to_string(float_format=lambda x: f"{x:>10.3f}"))
+            print(TEXT_SEPARATOR)
 
     if excel_output:
         prefix = f"statistics_{test_params['num_clients']}_clients"
@@ -1222,7 +1367,7 @@ def process_statistics(
                 )
                 startrow += len(gen_params_df) + 3
 
-            for params, df_stats in zip(params_list, df_list):
+            for idx, (params, df_stats) in enumerate(zip(params_list, df_list)):
                 df_params = pd.DataFrame([params])
                 df_params.to_excel(
                     writer, sheet_name="Summary", index=False, startrow=startrow
@@ -1232,6 +1377,20 @@ def process_statistics(
                     writer, sheet_name="Summary", index=True, startrow=startrow
                 )
                 startrow += len(df_stats) + 3
+
+                # Per-round breakdown for this warmup percentage
+                if (
+                    idx < len(per_round_tables)
+                    and per_round_tables[idx] is not None
+                    and len(per_round_tables[idx]) > 0
+                ):
+                    per_round_tables[idx].to_excel(
+                        writer,
+                        sheet_name="Summary",
+                        index=True,
+                        startrow=startrow,
+                    )
+                    startrow += len(per_round_tables[idx]) + 3
 
             raw_data.to_excel(writer, sheet_name="Raw data", index=False, startrow=0)
 

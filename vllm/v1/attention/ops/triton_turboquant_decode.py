@@ -130,6 +130,9 @@ def _tq_decode_stage1(
         val_bit_off = d_offs * 3
         val_byte_idx = val_bit_off // 8
         val_bit_shift = val_bit_off % 8
+    elif VQB == 2:
+        val_byte_idx = d_offs // 4
+        val_bit_shift = (d_offs % 4) * 2
 
     # Online softmax accumulators
     # Sink tokens provide a pre-computed attention bias that should be
@@ -282,6 +285,14 @@ def _tq_decode_stage1(
             ).to(tl.int32)
             raw16 = val_raw0 | (val_raw1 << 8)
             v_idx = ((raw16 >> val_bit_shift[None, :]) & 0x7).to(tl.float32)
+        elif VQB == 2:
+            val_addrs = val_bases[:, None] + val_byte_idx[None, :]
+            val_raw = tl.load(
+                KV_cache_ptr + val_addrs,
+                mask=kv_mask[:, None] & d_mask[None, :],
+                other=0,
+            ).to(tl.int32)
+            v_idx = ((val_raw >> val_bit_shift[None, :]) & 0x3).to(tl.float32)
         else:  # VQB == 4
             vb_idx = d_offs // 2
             vb_shift = (d_offs % 2) * 4
@@ -440,6 +451,13 @@ def _tq_full_dequant_kv(
         ).to(tl.int32)
         raw16_val = val_raw0 | (val_raw1 << 8)
         v_idx = ((raw16_val >> val_bit_shift) & 0x7).to(tl.float32)
+    elif VQB == 2:
+        val_byte_idx = d_offs // 4
+        val_bit_shift = (d_offs % 4) * 2
+        val_raw = tl.load(
+            KV_cache_ptr + val_base + val_byte_idx, mask=d_mask, other=0
+        ).to(tl.int32)
+        v_idx = ((val_raw >> val_bit_shift) & 0x3).to(tl.float32)
     else:
         v_idx = tl.zeros([BLOCK_D], dtype=tl.float32)
 

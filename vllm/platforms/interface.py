@@ -565,6 +565,43 @@ class Platform:
                 kv_quant_mode=kv_quant_mode,
                 tq_slot_size=tq_cfg.slot_size_aligned,
             ).page_size_bytes
+
+            # Per-layer dtype overrides (Phase 1D mixed-precision plan): when
+            # some layers run a different TQ preset (e.g. turboquant_k8v4 on
+            # boundary layers, turboquant_4bit_nc on the rest), the page size
+            # of the largest preset must be used for alignment. Walk every
+            # value in kv_cache_dtype_per_layer and take the max page size.
+            per_layer_max_page = 0
+            for override in (cache_config.kv_cache_dtype_per_layer or {}).values():
+                if not str(override).startswith("turboquant_"):
+                    # Non-TQ override — fall back to standard FullAttentionSpec
+                    # page size at model-native dtype as a conservative bound.
+                    per_layer_max_page = max(
+                        per_layer_max_page,
+                        FullAttentionSpec(
+                            block_size=1,
+                            num_kv_heads=model_config.get_num_kv_heads(parallel_config),
+                            head_size=model_config.get_head_size(),
+                            dtype=model_config.dtype,
+                        ).page_size_bytes,
+                    )
+                    continue
+                ovr_cfg = TurboQuantConfig.from_cache_dtype(
+                    str(override), model_config.get_head_size()
+                )
+                per_layer_max_page = max(
+                    per_layer_max_page,
+                    TQFullAttentionSpec(
+                        block_size=1,
+                        num_kv_heads=model_config.get_num_kv_heads(parallel_config),
+                        head_size=model_config.get_head_size(),
+                        head_size_v=model_config.get_head_size(),
+                        dtype=kv_cache_dtype,
+                        kv_quant_mode=kv_quant_mode,
+                        tq_slot_size=ovr_cfg.slot_size_aligned,
+                    ).page_size_bytes,
+                )
+
             if cache_config.kv_cache_dtype_skip_layers:
                 skip_page = FullAttentionSpec(
                     block_size=1,
@@ -572,7 +609,9 @@ class Platform:
                     head_size=model_config.get_head_size(),
                     dtype=model_config.dtype,
                 ).page_size_bytes
-                attn_page_size_1_token = max(tq_page, skip_page)
+                attn_page_size_1_token = max(tq_page, skip_page, per_layer_max_page)
+            elif per_layer_max_page > 0:
+                attn_page_size_1_token = max(tq_page, per_layer_max_page)
             else:
                 attn_page_size_1_token = tq_page
         else:

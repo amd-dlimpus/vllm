@@ -103,6 +103,37 @@ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 logger = init_logger(__name__)
 
 
+def _resolve_per_layer_cache_dtypes(
+    vllm_config: VllmConfig,
+) -> dict[str, str]:
+    """Translate cache_config.kv_cache_dtype_per_layer (keyed by layer index
+    string) into a {layer_name: cache_dtype} map (keyed by attention layer
+    prefix, e.g. "model.layers.0.self_attn.attn"), which is what
+    init_kv_cache expects.
+
+    Returns {} when the per-layer override is unset, so this is a no-op for
+    callers that aren't using Phase 1D mixed-precision tiering.
+    """
+    cache_config = vllm_config.cache_config
+    per_layer_idx = cache_config.kv_cache_dtype_per_layer or {}
+    if not per_layer_idx:
+        return {}
+
+    from vllm.config import get_layers_from_vllm_config
+    from vllm.model_executor.layers.attention_layer_base import (
+        AttentionLayerBase,
+    )
+    from vllm.model_executor.models.utils import extract_layer_index
+
+    attn_layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase)
+    out: dict[str, str] = {}
+    for layer_name in attn_layers:
+        layer_idx = str(extract_layer_index(layer_name))
+        if layer_idx in per_layer_idx:
+            out[layer_name] = per_layer_idx[layer_idx]
+    return out
+
+
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
@@ -393,6 +424,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         self.kv_caches: list[torch.Tensor] = []
+        cache_dtype_per_layer_by_name = (
+            _resolve_per_layer_cache_dtypes(self.vllm_config)
+        )
         kv_caches_dict = init_kv_cache(
             self.kv_caches,
             self.compilation_config.static_forward_context,
@@ -400,6 +434,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.attn_backends,
             self.device,
             self.cache_config.cache_dtype,
+            cache_dtype_per_layer_by_name,
         )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 

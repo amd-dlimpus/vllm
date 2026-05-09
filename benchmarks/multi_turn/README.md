@@ -7,10 +7,20 @@ First start serving your model
 ```bash
 export MODEL_PATH=/models/meta-llama/Meta-Llama-3.1-8B-Instruct/
 
-vllm serve $MODEL_PATH --served-model-name Llama
+vllm serve $MODEL_PATH --served-model-name Llama \
+    --enable-prefix-caching \
+    --enable-prompt-tokens-details
 ```
 
 The variable `MODEL_PATH` should be a path to the model files (e.g. downloaded from huggingface).
+
+> **Required for cache hit rate reporting:** start vLLM with
+> `--enable-prefix-caching` and `--enable-prompt-tokens-details`. The benchmark
+> sends `stream_options.include_usage=true` and reads the
+> `prompt_tokens_details.cached_tokens` field from each response to compute
+> the true (server-reported) cache hit rate. If `--enable-prompt-tokens-details`
+> is missing, the benchmark still runs but will print a warning and skip the
+> cache-hit metric.
 
 ## Synthetic Multi-Turn Conversations
 
@@ -58,6 +68,45 @@ output_num_chunks  166.0    99.01   11.80    79.00    90.00    98.00   108.75   
 If you run with `--warmup-step`, the summary will also include `warmup_runtime_sec`
 and `total_runtime_incl_warmup_sec` (while `runtime_sec` continues to reflect the
 benchmark-only runtime so the reported throughput stays comparable).
+
+### Cache hit rate and per-round breakdown
+
+When the server is started with `--enable-prompt-tokens-details`, the summary
+adds three lines computed from server-reported usage:
+
+```
+cache_hit_rate         = 0.8571  (85.71%)
+total_prompt_tokens    = 1234567
+total_cached_tokens    = 1058293
+input_token_throughput = 5612.4   # tokens/sec
+```
+
+A per-round table is then printed showing how cache hit rate evolves across
+turns. Round 0 is the cold first user turn; later rounds should approach 100%
+cache hit rate when prefix caching is healthy (history matches what's cached):
+
+```
+Per-round breakdown:
+              count  ttft_ms_mean  tpot_ms_mean  latency_ms_mean  input_tokens_mean  output_tokens_mean  cached_tokens_sum  prompt_tokens_sum  cache_hit_rate
+round_index
+0                40       210.118        25.123         2545.000           4032.500             100.000               9344             161300           0.058
+1                40        85.412        24.987         2530.000           5732.500             100.000             214921             229300           0.937
+2                40        82.901        24.886         2528.500           7432.500             100.000             279500             297300           0.940
+...
+```
+
+This per-round view is the primary signal for evaluating KV-cache compression
+algorithms (FP8, INT4, TurboQuant, etc.). When memory is the bottleneck,
+baseline (BF16) starts evicting prefix cache and round-N cache hit rate
+collapses, while a more memory-efficient scheme keeps round-N cache hit
+near 1.0 for longer. To force memory pressure, raise `num_conversations`,
+`prefix_num_tokens`, and/or `num_turns` until the model can no longer fit
+all per-conversation KV in cache simultaneously.
+
+The same per-round table is also written to the `Summary` sheet of the
+Excel export when `--excel-output` is used, and every per-request row in
+`--stats-json-output` includes `round_index`, `cached_tokens`, and
+`server_prompt_tokens` for downstream analysis.
 
 ### JSON configuration file for synthetic conversations generation
 

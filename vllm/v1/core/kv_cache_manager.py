@@ -11,6 +11,7 @@ from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.two_pool_kv_cache import is_prefix_tier_enabled
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
@@ -151,6 +152,25 @@ class KVCacheManager:
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
+
+        # Phase 1E: prefix-tier two-pool allocation. Gated behind
+        # VLLM_TQ_PREFIX_TIER=1. When off (default), this manager is the
+        # unmodified single-pool allocator. When on, allocate_slots() will
+        # tag each newly-allocated block with a PoolID via maybe_tag_block_pool
+        # so the runner can emit per-pool block tables to the v3_split kernel.
+        # See vllm/v1/core/two_pool_kv_cache.py for the design.
+        # TODO(prefix-tier): wire pool tagging into allocate_slots() and the
+        # block-pool free-list once the kernel and runner integration land.
+        self._prefix_tier_enabled = is_prefix_tier_enabled()
+        if self._prefix_tier_enabled:
+            logger.warning(
+                "VLLM_TQ_PREFIX_TIER=1: prefix-tier two-pool KV cache "
+                "scaffolding is active, but full integration is incomplete. "
+                "Block allocation falls back to single-pool until "
+                "phase1e_two_pool_alloc, phase1e_split_kernel, and "
+                "phase1e_continuation are merged together. See "
+                "vllm/v1/core/two_pool_kv_cache.py for the design."
+            )
 
     @property
     def usage(self) -> float:

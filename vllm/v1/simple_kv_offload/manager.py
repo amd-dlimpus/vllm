@@ -3,6 +3,8 @@
 """Scheduler-side manager for SimpleCPUOffloadConnector."""
 
 import contextlib
+import os
+from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -152,6 +154,61 @@ class SimpleCPUOffloadScheduler:
         # Events must be reported by all world_size workers before considered complete.
         self._expected_worker_count = vllm_config.parallel_config.world_size
         self._store_event_pending_counts: dict[int, int] = {}
+
+        # ─────────────── RAPP (predictive prefetch) ───────────────
+        # OFF by default. Set VLLM_RAPP=1 to enable. Behavior is
+        # byte-identical to today when disabled.
+        #
+        # Mechanism: when a request finishes, push its prefix block
+        # hashes (those still on the CPU pool) into a bounded warm queue.
+        # On scheduler steps where no demand-load is competing, emit a
+        # prefetch H2D for warm-queue blocks that are not currently in
+        # the GPU prefix cache. When the prefetch load event completes
+        # (reported via SimpleCPUOffloadWorkerMetadata.completed_load_events),
+        # promote the freshly-loaded blocks into the GPU prefix cache.
+        self._rapp_enabled: bool = os.environ.get("VLLM_RAPP", "0") not in (
+            "0", "", "false", "False",
+        )
+        # Caps. Override via env vars; defaults sized for ~256 MB/step
+        # of prefetch traffic at typical TQ44 page sizes (~8 KB/block at
+        # 80 layers => 256 MB / 8 KB ≈ 32K blocks; the realistic bound
+        # is one warm session's prefix per step, not 32K, so we cap much
+        # lower).
+        self._rapp_max_blocks_per_step: int = int(
+            os.environ.get("VLLM_RAPP_MAX_BLOCKS_PER_STEP", "32")
+        )
+        # Floor on free GPU blocks before we even consider prefetching.
+        # Don't dip into pool space that demand traffic might need.
+        self._rapp_min_gpu_free_blocks: int = int(
+            os.environ.get("VLLM_RAPP_MIN_GPU_FREE_BLOCKS", "256")
+        )
+        # Warm queue capacity. LRU-style.
+        self._rapp_warm_queue_capacity: int = int(
+            os.environ.get("VLLM_RAPP_WARM_QUEUE_CAP", "8192")
+        )
+        # block_hash -> True (we use OrderedDict to evict oldest)
+        self._rapp_warm_queue: OrderedDict[bytes, None] = OrderedDict()
+        # Prefetch event tracking: load_event_idx -> [(gpu_block, block_hash)]
+        # When the event completes, we register these in the GPU prefix cache.
+        self._rapp_pending_inserts: dict[
+            int, list[tuple["KVCacheBlock", bytes]]
+        ] = {}
+        # Multi-worker aggregation for prefetch load events (mirror of stores).
+        self._rapp_load_event_pending_counts: dict[int, int] = {}
+        # Telemetry
+        self._rapp_emitted_prefetches: int = 0  # blocks scheduled for prefetch
+        self._rapp_completed_prefetches: int = 0  # blocks promoted to GPU cache
+        self._rapp_skipped_demand_busy: int = 0  # steps skipped (demand-load active)
+        self._rapp_skipped_no_capacity: int = 0  # steps skipped (GPU pool tight)
+        self._rapp_skipped_already_resident: int = 0  # warm hashes already in GPU cache
+        if self._rapp_enabled:
+            logger.info(
+                "RAPP (predictive prefetch) ENABLED: max_blocks/step=%d, "
+                "min_gpu_free=%d, warm_queue_cap=%d",
+                self._rapp_max_blocks_per_step,
+                self._rapp_min_gpu_free_blocks,
+                self._rapp_warm_queue_capacity,
+            )
 
     @staticmethod
     def _derive_cpu_config(
@@ -351,6 +408,20 @@ class SimpleCPUOffloadScheduler:
                 self._reqs_to_load[req_id].load_event = load_event
             self._load_event_to_reqs[load_event] = load_req_ids
 
+        # --- RAPP prefetch (only when no demand load competes this step) ---
+        if self._rapp_enabled and not load_req_ids:
+            prefetch_gpu, prefetch_cpu = self._emit_rapp_prefetch_specs()
+            if prefetch_gpu:
+                load_event = self._load_event_counter
+                self._load_event_counter += 1
+                load_gpu.extend(prefetch_gpu)
+                load_cpu.extend(prefetch_cpu)
+                # Empty req_id list -- worker will report completion via
+                # completed_load_events (no req_ids => prefetch event).
+                self._load_event_to_reqs[load_event] = []
+        elif self._rapp_enabled and load_req_ids:
+            self._rapp_skipped_demand_busy += 1
+
         result = SimpleCPUOffloadMetadata(
             load_event=load_event,
             load_gpu_blocks=load_gpu,
@@ -362,6 +433,148 @@ class SimpleCPUOffloadScheduler:
             need_flush=bool(scheduler_output.preempted_req_ids),
         )
         return result
+
+    # ─────────────── RAPP helpers ───────────────
+
+    def _rapp_warm_queue_push(self, block_hash: bytes) -> None:
+        """LRU-touch this block hash in the warm queue. Called when a
+        request's prefix block is observed at request finish."""
+        if block_hash in self._rapp_warm_queue:
+            self._rapp_warm_queue.move_to_end(block_hash)
+        else:
+            self._rapp_warm_queue[block_hash] = None
+            while len(self._rapp_warm_queue) > self._rapp_warm_queue_capacity:
+                self._rapp_warm_queue.popitem(last=False)
+
+    def _emit_rapp_prefetch_specs(self) -> tuple[list[int], list[int]]:
+        """Walk the warm queue (most-recent first) and emit up to
+        max_blocks_per_step prefetch (gpu_block_id, cpu_block_id) pairs.
+
+        Skips block hashes that are:
+          - already in the GPU prefix cache (we win, we drop the entry),
+          - not in CPU prefix cache (CPU cache evicted them; we drop),
+        Returns ([], []) if GPU pool free count is below the floor.
+
+        Allocates fresh GPU blocks but **does not yet register them in the
+        GPU prefix cache** — that registration is deferred to
+        _process_rapp_prefetch_completion when the load event fires.
+        """
+        if not self._rapp_warm_queue:
+            return [], []
+        gpu_pool = self._gpu_block_pool
+        cpu_pool = self.cpu_block_pool
+        if gpu_pool is None:
+            return [], []
+
+        gpu_free = gpu_pool.get_num_free_blocks()
+        cap = self._rapp_max_blocks_per_step
+        # Hard floor: don't dip into reserve. Demand traffic comes first.
+        if gpu_free < self._rapp_min_gpu_free_blocks + cap:
+            self._rapp_skipped_no_capacity += 1
+            return [], []
+
+        # Walk the warm queue from most-recent (rightmost). Drop entries
+        # that are already on GPU or no longer on CPU.
+        candidate_hashes: list[bytes] = []
+        candidate_cpu_blocks: list["KVCacheBlock"] = []
+        warm_keys = list(reversed(self._rapp_warm_queue.keys()))
+        for bhash in warm_keys:
+            if len(candidate_hashes) >= cap:
+                break
+            cpu_blk = cpu_pool.cached_block_hash_to_block.get_one_block(bhash)
+            if cpu_blk is None:
+                # Evicted from CPU; drop from warm queue.
+                self._rapp_warm_queue.pop(bhash, None)
+                continue
+            gpu_blk = gpu_pool.cached_block_hash_to_block.get_one_block(bhash)
+            if gpu_blk is not None:
+                # Already on GPU; we already win. Drop from warm queue.
+                self._rapp_skipped_already_resident += 1
+                self._rapp_warm_queue.pop(bhash, None)
+                continue
+            candidate_hashes.append(bhash)
+            candidate_cpu_blocks.append(cpu_blk)
+
+        if not candidate_hashes:
+            return [], []
+
+        # Allocate fresh GPU blocks for prefetch destinations. These blocks
+        # are taken from the free queue and have ref_count=1 after
+        # get_new_blocks(); we'll free them once the prefetch completes
+        # AND the prefix-cache insertion has been done, so the blocks
+        # become discoverable as cached but evictable.
+        new_gpu_blocks = gpu_pool.get_new_blocks(len(candidate_hashes))
+        # Touch CPU blocks to prevent eviction during the async H2D.
+        cpu_pool.touch(candidate_cpu_blocks)
+
+        # Defer prefix-cache insertion until the load event completes.
+        # Stash the (gpu_block, hash) pairs so we can promote them on
+        # completion.
+        # The event_idx is assigned in build_connector_meta; we register
+        # the pending insertion with the event_idx the caller will use.
+        # (We pass the next event idx via the return tuple instead.)
+        # NOTE: build_connector_meta consumes self._load_event_counter
+        # right after this call returns. Stash the pending entries keyed
+        # by the value the counter WILL HAVE.
+        upcoming_event_idx = self._load_event_counter
+        self._rapp_pending_inserts[upcoming_event_idx] = list(
+            zip(new_gpu_blocks, candidate_hashes)
+        )
+        self._rapp_emitted_prefetches += len(candidate_hashes)
+
+        # Pop all hashes that were prefetched out of the warm queue —
+        # they shouldn't be re-emitted on the next step.
+        for bhash in candidate_hashes:
+            self._rapp_warm_queue.pop(bhash, None)
+
+        return (
+            [b.block_id for b in new_gpu_blocks],
+            [c.block_id for c in candidate_cpu_blocks],
+        )
+
+    def _process_rapp_prefetch_completion(self, event_idx: int) -> None:
+        """Promote freshly-loaded prefetch blocks into GPU prefix cache.
+
+        Called when the prefetch load event fires (all workers have
+        confirmed). Inserts each (gpu_block, hash) into the GPU prefix
+        cache and frees the GPU block ref count so it's evictable but
+        discoverable.
+        """
+        pending = self._rapp_pending_inserts.pop(event_idx, None)
+        if not pending:
+            return
+        gpu_pool = self._gpu_block_pool
+        if gpu_pool is None:
+            return  # shouldn't happen, but defensively
+        promoted_blocks: list["KVCacheBlock"] = []
+        for gpu_blk, bhash in pending:
+            # Only promote if no other request grabbed this hash slot
+            # while the load was in flight.
+            existing = gpu_pool.cached_block_hash_to_block.get_one_block(bhash)
+            if existing is None:
+                gpu_blk._block_hash = bhash  # type: ignore[assignment]
+                gpu_pool.cached_block_hash_to_block.insert(bhash, gpu_blk)
+            promoted_blocks.append(gpu_blk)
+        # Free our ref so blocks become evictable; they remain in the
+        # prefix cache map for discovery.
+        if promoted_blocks:
+            gpu_pool.free_blocks(promoted_blocks)
+            self._rapp_completed_prefetches += len(promoted_blocks)
+
+    def rapp_telemetry(self) -> dict[str, int]:
+        """Return current telemetry counters. Useful for tests / logs."""
+        return {
+            "enabled": int(self._rapp_enabled),
+            "warm_queue_len": len(self._rapp_warm_queue),
+            "pending_inserts": sum(
+                len(v) for v in self._rapp_pending_inserts.values()
+            ),
+            "emitted_prefetches": self._rapp_emitted_prefetches,
+            "completed_prefetches": self._rapp_completed_prefetches,
+            "skipped_demand_busy": self._rapp_skipped_demand_busy,
+            "skipped_no_capacity": self._rapp_skipped_no_capacity,
+            "skipped_already_resident": self._rapp_skipped_already_resident,
+        }
 
     def prepare_store_specs(
         self, scheduler_output: SchedulerOutput
@@ -581,16 +794,17 @@ class SimpleCPUOffloadScheduler:
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         """Handle async transfer completions from worker.
 
-        Load completions arrive via finished_recving (real req_ids).
-        Store completions arrive via kv_connector_worker_meta as
-        per-event worker counts. We accumulate across steps and process
-        a store event only when all workers have reported completion.
+        Demand-load completions arrive via finished_recving (real req_ids).
+        Store completions and RAPP prefetch-load completions arrive via
+        kv_connector_worker_meta as per-event worker counts. We
+        accumulate across steps and process an event only when all
+        workers have reported completion.
         """
-        # --- Load completions ---
+        # --- Demand load completions ---
         for req_id in list(connector_output.finished_recving or []):
             self._cleanup_load_request(req_id)
 
-        # --- Store completions ---
+        # --- Store + prefetch-load completions ---
         meta = connector_output.kv_connector_worker_meta
         if not isinstance(meta, SimpleCPUOffloadWorkerMetadata):
             return
@@ -601,6 +815,16 @@ class SimpleCPUOffloadScheduler:
                 self._process_store_event(event_idx)
             else:
                 self._store_event_pending_counts[event_idx] = total
+        if self._rapp_enabled:
+            for event_idx, count in meta.completed_load_events.items():
+                total = self._rapp_load_event_pending_counts.get(event_idx, 0) + count
+                if total >= self._expected_worker_count:
+                    self._rapp_load_event_pending_counts.pop(event_idx, None)
+                    self._process_rapp_prefetch_completion(event_idx)
+                    # Drop the empty req_id entry from the global map.
+                    self._load_event_to_reqs.pop(event_idx, None)
+                else:
+                    self._rapp_load_event_pending_counts[event_idx] = total
 
     def _process_store_event(self, event_idx: int) -> None:
         """Process a fully-completed store event."""
@@ -676,6 +900,20 @@ class SimpleCPUOffloadScheduler:
                     store_state.finished = True  # Defer: stores in-flight
                 else:
                     self._cleanup_store_request(req_id)
+
+        # RAPP: when this request finishes, mark its prefix block hashes
+        # as "warm" — likely to be reused by a future request (same chat
+        # session in agentic workloads). We read the *wrapped*
+        # BlockHashWithGroupId off the GPU blocks themselves (set during
+        # cache_full_blocks / store completion), since that is the key
+        # used by both GPU and CPU prefix caches.
+        if self._rapp_enabled and self._gpu_block_pool is not None and block_ids:
+            for bid in block_ids:
+                if bid < 0 or bid >= len(self._gpu_block_pool.blocks):
+                    continue
+                bhash = self._gpu_block_pool.blocks[bid].block_hash
+                if bhash is not None:
+                    self._rapp_warm_queue_push(bhash)
 
         return False, None
 

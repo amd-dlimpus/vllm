@@ -266,6 +266,31 @@ class Attention(nn.Module, AttentionLayerBase):
                 sliding_window,
             )
 
+        # Per-layer dtype override (Phase 1D of prefill-tier mixed-precision
+        # KV plan). Applied AFTER the skip check, so a layer that is in
+        # kv_cache_dtype_skip_layers stays at "auto" — skip wins. A layer
+        # listed in kv_cache_dtype_per_layer overrides the global cache_dtype
+        # for this layer only. Used to put boundary / high-mass layers at
+        # turboquant_k8v4 (TQ84) while the rest stay at turboquant_4bit_nc
+        # (TQ44).
+        if (
+            cache_config is not None
+            and cache_config.kv_cache_dtype_per_layer
+            and kv_cache_dtype != "auto"
+        ):
+            from vllm.model_executor.models.utils import extract_layer_index
+
+            layer_idx = extract_layer_index(prefix)
+            override = cache_config.kv_cache_dtype_per_layer.get(str(layer_idx))
+            if override is not None:
+                logger.info(
+                    "Layer %s: kv_cache_dtype_per_layer override %s -> %s",
+                    prefix,
+                    kv_cache_dtype,
+                    override,
+                )
+                kv_cache_dtype = override
+
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             kv_cache_dtype, vllm_config.model_config
         )
@@ -737,3 +762,35 @@ direct_register_custom_op(
     mutates_args=["output", "output_block_scale"],
     fake_impl=unified_attention_with_output_fake,
 )
+
+
+# --- KIVI/RTN fake-quant auto-install (subprocess-safe) ---------------------
+# If VLLM_KV_QUANT_SCHEME is set in the environment, install the hook that
+# round-trips K/V through the validated kivi_ref / rtn_ref kernels right at
+# Attention.forward entry. See experiments/kivi_rtn_src/vllm_kv_quant_hook.py.
+import os as _os  # noqa: E402
+if _os.environ.get("VLLM_KV_QUANT_SCHEME", "").strip():
+    try:
+        import sys as _sys  # noqa: E402
+        _vllm_profiling_root = _os.environ.get(
+            "VLLM_PROFILING_ROOT", "/scratch/dlimpus/vllm-profiling"
+        )
+        if _vllm_profiling_root not in _sys.path:
+            _sys.path.insert(0, _vllm_profiling_root)
+        from experiments.kivi_rtn_src.vllm_kv_quant_hook import (  # noqa: E402
+            install_from_env as _kv_quant_install,
+        )
+        _kv_quant_state = _kv_quant_install()
+        if _kv_quant_state is not None:
+            logger.info(
+                "KV-quant hook installed: scheme=%s kbits=%d vbits=%d g=%d skip=%s",
+                _kv_quant_state.scheme,
+                _kv_quant_state.k_bits,
+                _kv_quant_state.v_bits,
+                _kv_quant_state.group_size,
+                sorted(_kv_quant_state.skip_layers),
+            )
+    except Exception as _e:  # pragma: no cover
+        import traceback as _tb  # noqa: E402
+        logger.error("KV-quant hook install failed: %s\n%s", _e, _tb.format_exc())
+# ----------------------------------------------------------------------------

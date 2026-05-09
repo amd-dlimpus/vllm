@@ -277,6 +277,16 @@ def _tq_load_v_tile(
         else:
             val_raw = tl.load(KV_cache_ptr + val_addrs, mask=tile_mask[:, None] & d_mask[None, :], other=0).to(tl.int32)
         v_idx = ((val_raw >> vb_shift[None, :]) & 0xF).to(tl.float32)
+    elif VQB == 2:
+        # Each value is packed as 2 bits, so 4 values per byte
+        vb_idx = d_offs // 4
+        vb_shift = (d_offs % 4) * 2
+        val_addrs = val_bases[:, None] + vb_idx[None, :]
+        if UNMASKED:
+            val_raw = tl.load(KV_cache_ptr + val_addrs, mask=d_mask[None, :], other=0).to(tl.int32)
+        else:
+            val_raw = tl.load(KV_cache_ptr + val_addrs, mask=tile_mask[:, None] & d_mask[None, :], other=0).to(tl.int32)
+        v_idx = ((val_raw >> vb_shift[None, :]) & 0x3).to(tl.float32)
     else:  # VQB == 3
         val_bit_off = d_offs * 3
         val_byte_idx = val_bit_off // 8
@@ -1399,3 +1409,132 @@ def triton_turboquant_decode_attention_v3(
         sinks=sinks,
     )
     return out
+
+
+# ---------------------------------------------------------------------------
+# Phase 1E: prefix-tier two-pool attention (v3_split)
+# ---------------------------------------------------------------------------
+#
+# Public API contract for the new attention kernel that consumes two
+# physical KV caches:
+#
+#   * ``pool_a_*`` arguments hold the high-precision (TQ84) prefix pool —
+#     prefill-chunk-1 blocks.
+#   * ``pool_b_*`` arguments hold the low-precision (TQ44) dialogue pool —
+#     continuation-prefill and decode blocks.
+#
+# Two-phase iteration order (from the plan):
+#   Per request, iterate ``block_table_a[0:split]`` reading from pool A
+#   with TQ84 dequant, then ``block_table_b[split:]`` from pool B with
+#   TQ44 dequant. Single online softmax accumulator across both phases —
+#   no per-block branching, branch divergence ≈ 0.
+#
+# **STATUS — kernel scaffold only.** Implementing a correct, performant
+# fused two-phase Triton kernel takes days of expert work and is out of
+# scope for the initial Phase 1E landing. The launcher below is a
+# fail-loud stub: it validates the contract and raises a clear
+# NotImplementedError so callers get a useful message rather than
+# silently-wrong outputs. Wiring (continuation_prefill, runner) writes
+# against this signature so swapping the stub for the real kernel later
+# is a one-file change.
+#
+# When the fused kernel lands it should:
+#   1. Produce ``output[N, Hq, D]`` matching:
+#        attn = softmax([Q·K_a; Q·K_b] / sqrt(D)) · [V_a; V_b]
+#      i.e., logically equivalent to running TQ attention over the
+#      concatenated cache with mixed dequant per block.
+#   2. Honor the same causal-mask / GQA / sinks / fuse_q_rot semantics as
+#      the existing v3 kernel.
+#   3. Cost ≤4% TPOT vs. pure single-pool TQ44 (per the plan's bar).
+#
+# Fallback "Option A" (also from the plan's Risks section): two passes
+# through the existing v3 kernel + LSE merge in fp32. Costs ~5–10% TPOT
+# but uses unmodified kernels. The current ``triton_turboquant_unified_attention``
+# does NOT return LSE, so Option A also requires kernel changes (modest:
+# add an optional ``return_lse`` output buffer). Either path is a
+# follow-up; not included here.
+
+
+def triton_turboquant_unified_attention_split(
+    query: torch.Tensor,  # [num_tokens, Hq, D]
+    pool_a_kv_cache: torch.Tensor,  # TQ84 cache [n_blocks_a, bs, Hk, slot_a]
+    pool_b_kv_cache: torch.Tensor,  # TQ44 cache [n_blocks_b, bs, Hk, slot_b]
+    pool_a_block_table: torch.Tensor,  # [num_seqs, max_a_blocks] int32
+    pool_b_block_table: torch.Tensor,  # [num_seqs, max_b_blocks] int32
+    pool_a_seq_lens: torch.Tensor,  # tokens served from pool A per seq
+    pool_b_seq_lens: torch.Tensor,  # tokens served from pool B per seq
+    query_start_loc: torch.Tensor,
+    *,
+    pool_a_Pi: torch.Tensor,
+    pool_a_centroids: torch.Tensor,
+    pool_a_mse_bits: int,
+    pool_a_key_packed_size: int,
+    pool_a_value_quant_bits: int,
+    pool_a_value_packed_size: int,
+    pool_a_key_fp8: bool,
+    pool_a_norm_correction: bool,
+    pool_a_PiT: torch.Tensor | None = None,
+    pool_b_Pi: torch.Tensor,
+    pool_b_centroids: torch.Tensor,
+    pool_b_mse_bits: int,
+    pool_b_key_packed_size: int,
+    pool_b_value_quant_bits: int,
+    pool_b_value_packed_size: int,
+    pool_b_key_fp8: bool,
+    pool_b_norm_correction: bool,
+    pool_b_PiT: torch.Tensor | None = None,
+    scale: float,
+    output: torch.Tensor | None = None,
+    sinks: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """v3_split launcher — two-pool TQ attention. **Stub.**
+
+    This stub validates the call contract and raises ``NotImplementedError``
+    when invoked. The real kernel implementation is tracked under
+    `phase1e_split_kernel`; landing it is a one-file change because the
+    upstream Python (continuation_prefill, runner) is written against
+    this signature.
+
+    Validation done here (cheap, catches misuse early):
+      * Both caches share ``block_size`` and ``Hk`` shape on dim 1, 2.
+      * Per-seq pool A + pool B = total seq_len (i.e. every cached token
+        lives in exactly one pool).
+      * ``pool_a_block_table`` and ``pool_b_block_table`` have matching
+        first dim (num_seqs) and an int dtype.
+    """
+    if query.dim() != 3:
+        raise ValueError(f"query must be [N, Hq, D]; got {query.shape}")
+    if pool_a_kv_cache.dim() != 4 or pool_b_kv_cache.dim() != 4:
+        raise ValueError(
+            "pool_a_kv_cache and pool_b_kv_cache must be 4-D "
+            f"[num_blocks, block_size, Hk, slot]; got A={pool_a_kv_cache.shape} "
+            f"B={pool_b_kv_cache.shape}"
+        )
+    a_bs, a_Hk = pool_a_kv_cache.shape[1], pool_a_kv_cache.shape[2]
+    b_bs, b_Hk = pool_b_kv_cache.shape[1], pool_b_kv_cache.shape[2]
+    if a_bs != b_bs or a_Hk != b_Hk:
+        raise ValueError(
+            f"pool A/B must share block_size and Hk; got "
+            f"A=(block_size={a_bs}, Hk={a_Hk}) B=(block_size={b_bs}, Hk={b_Hk})"
+        )
+    if pool_a_block_table.shape[0] != pool_b_block_table.shape[0]:
+        raise ValueError(
+            f"pool_a_block_table and pool_b_block_table must have same num_seqs; "
+            f"got A={pool_a_block_table.shape[0]} B={pool_b_block_table.shape[0]}"
+        )
+    if pool_a_seq_lens.shape != pool_b_seq_lens.shape:
+        raise ValueError(
+            f"pool_a_seq_lens and pool_b_seq_lens shape mismatch: "
+            f"{pool_a_seq_lens.shape} vs {pool_b_seq_lens.shape}"
+        )
+
+    raise NotImplementedError(
+        "triton_turboquant_unified_attention_split is the API contract for "
+        "the Phase 1E v3_split kernel; the fused kernel implementation has "
+        "not landed yet. To run the prefill-tier mixed-precision path, the "
+        "kernel author needs to implement either: (1) the two-phase fused "
+        "kernel (preferred — matches the plan, ≤4% TPOT cost) or (2) the "
+        "two-pass + LSE merge fallback (~5–10% TPOT cost; needs an "
+        "optional return_lse buffer added to the existing v3 kernel). "
+        "Until then, do not enable VLLM_TQ_PREFIX_TIER."
+    )

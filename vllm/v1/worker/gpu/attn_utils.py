@@ -146,8 +146,10 @@ def _reshape_kv_cache(
     kv_cache_raw_tensors: dict[str, torch.Tensor],
     attn_backends: dict[str, type[AttentionBackend]],
     cache_dtype: str,
+    cache_dtype_per_layer: dict[str, str] | None = None,
 ) -> dict[str, torch.Tensor]:
     kv_caches: dict[str, torch.Tensor] = {}
+    cache_dtype_per_layer = cache_dtype_per_layer or {}
     for kv_cache_group_spec in kv_cache_config.kv_cache_groups:
         for layer_name in kv_cache_group_spec.layer_names:
             kv_cache_spec = kv_cache_group_spec.kv_cache_spec
@@ -159,13 +161,20 @@ def _reshape_kv_cache(
             assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
             num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
 
+            # Phase 1D: per-layer dtype override. If this layer has its own
+            # cache_dtype (e.g. layer 0 uses turboquant_k8v4 while the rest
+            # use turboquant_4bit_nc), pass that dtype to get_kv_cache_shape
+            # so the slot size is computed from the right preset. If no
+            # override, use the global cache_dtype.
+            layer_cache_dtype = cache_dtype_per_layer.get(layer_name, cache_dtype)
+
             attn_backend = attn_backends[layer_name]
             kv_cache_shape = attn_backend.get_kv_cache_shape(
                 num_blocks,
                 kv_cache_spec.block_size,
                 kv_cache_spec.num_kv_heads,
                 kv_cache_spec.head_size,
-                cache_dtype,
+                layer_cache_dtype,
             )
 
             # FIXME(woosuk): Add kv_cache_stride_order to all attention backends.
@@ -195,10 +204,15 @@ def init_kv_cache(
     attn_backends: dict[str, type[AttentionBackend]],
     device: torch.device,
     cache_dtype: str,
+    cache_dtype_per_layer: dict[str, str] | None = None,
 ) -> dict[str, torch.Tensor]:
     kv_cache_raw_tensors = _allocate_kv_cache(kv_cache_config, device)
     kv_caches = _reshape_kv_cache(
-        kv_cache_config, kv_cache_raw_tensors, attn_backends, cache_dtype
+        kv_cache_config,
+        kv_cache_raw_tensors,
+        attn_backends,
+        cache_dtype,
+        cache_dtype_per_layer,
     )
     bind_kv_cache(kv_caches, forward_context, runner_kv_caches)
     return kv_caches

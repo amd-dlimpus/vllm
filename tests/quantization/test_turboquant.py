@@ -72,6 +72,14 @@ PRESET_EXPECTED = {
         key_packed_size=50, value_packed_size=52,
         slot_size=102, slot_size_aligned=102,
     ),
+    "turboquant_k4v2_nc": dict(
+        key_fp8=False, key_quant_bits=4,
+        key_mse_bits=4, value_quant_bits=2,
+        mse_bits=4, n_centroids=16, centroid_bits=4,
+        norm_correction=True,
+        key_packed_size=66, value_packed_size=36,
+        slot_size=102, slot_size_aligned=102,
+    ),
 }
 # fmt: on
 
@@ -513,7 +521,7 @@ class TestStoreDecodeRoundTrip:
 
     @pytest.mark.parametrize(
         "preset",
-        ["turboquant_k8v4", "turboquant_4bit_nc"],
+        ["turboquant_k8v4", "turboquant_4bit_nc", "turboquant_k4v2_nc"],
     )
     def test_single_token_roundtrip(self, preset):
         """Store 1 token, decode with query=key, check attention output.
@@ -617,8 +625,14 @@ class TestStoreDecodeRoundTrip:
                 out_fp32[0, h].unsqueeze(0),
                 val_fp32[0, h].unsqueeze(0),
             ).item()
-            # FP8 keys should be very accurate; MSE keys have more error
-            threshold = 0.95 if cfg.key_fp8 else 0.85
+            # FP8 keys → very accurate; 4-bit MSE keys → moderate error;
+            # 2-bit values are very lossy and dominate the output error.
+            if cfg.key_fp8:
+                threshold = 0.95
+            elif cfg.value_quant_bits == 2:
+                threshold = 0.85
+            else:
+                threshold = 0.85
             assert cos_sim > threshold, (
                 f"Preset {preset} head {h}: cosine_sim={cos_sim:.4f} < {threshold}"
             )
@@ -965,7 +979,10 @@ class TestDecodeV2Equivalence:
     # Guards against any uninitialized memory / race / nondeterministic
     # reduction in the optimized kernel.
 
-    @pytest.mark.parametrize("preset", ["turboquant_k8v4", "turboquant_4bit_nc"])
+    @pytest.mark.parametrize(
+        "preset",
+        ["turboquant_k8v4", "turboquant_4bit_nc", "turboquant_k4v2_nc"],
+    )
     @pytest.mark.parametrize(
         "B,Hq,Hk,D,seq_len",
         [
@@ -1188,7 +1205,10 @@ class TestDecodeV3Equivalence:
     # Tier 3: v3 determinism — same inputs must give identical outputs.
     # ------------------------------------------------------------------
 
-    @pytest.mark.parametrize("preset", ["turboquant_k8v4", "turboquant_4bit_nc"])
+    @pytest.mark.parametrize(
+        "preset",
+        ["turboquant_k8v4", "turboquant_4bit_nc", "turboquant_k4v2_nc"],
+    )
     @pytest.mark.parametrize(
         "B,Hq,Hk,D,seq_len",
         [
