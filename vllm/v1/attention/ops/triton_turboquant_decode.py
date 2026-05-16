@@ -539,6 +539,12 @@ def _assert_tq_output(out, *, kernel: str, extra: str = "") -> None:
     """Output-side sanity assertions (env-gated, mirrors unified)."""
     if os.environ.get("VLLM_TQ_DEBUG_ASSERTS") != "1":
         return
+    # Synchronous checks (.item()) are illegal during CUDA-graph capture.
+    try:
+        if torch.cuda.is_current_stream_capturing():
+            return
+    except Exception:
+        pass
     t = out[0] if isinstance(out, tuple) else out
     has_nan = bool(torch.isnan(t).any().item())
     has_inf = bool(torch.isinf(t).any().item())
