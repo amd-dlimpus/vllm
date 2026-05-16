@@ -42,6 +42,14 @@ class NewRequestData:
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
 
+    # Phase 1E (prefix-tier mixed-precision KV). The engine-side
+    # ``Request.prefix_tier_split_token`` value at the moment of dispatch.
+    # ``None`` means the request was never tagged for two-pool allocation
+    # (legacy single-pool path). Forwarded into the worker's
+    # ``CachedRequestState`` so the runner can gather per-batch split
+    # tokens at metadata-build time.
+    prefix_tier_split_token: int | None = None
+
     @classmethod
     def from_request(
         cls,
@@ -60,6 +68,7 @@ class NewRequestData:
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
             prefill_token_ids=prefill_token_ids,
+            prefix_tier_split_token=request.prefix_tier_split_token,
         )
 
     def __repr__(self) -> str:

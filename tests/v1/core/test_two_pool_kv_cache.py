@@ -21,6 +21,7 @@ from vllm.v1.core.two_pool_kv_cache import (
     TwoPoolDtypeConfig,
     is_prefix_tier_enabled,
     maybe_tag_block_pool,
+    partition_block_table_by_split_token,
     select_pool,
 )
 
@@ -175,3 +176,118 @@ def test_maybe_tag_block_pool_decode():
     )
     assert desc.block_id == 99
     assert desc.pool_id is PoolID.DIALOGUE
+
+
+# Block-table partitioning --------------------------------------------------
+
+
+def test_partition_split_zero_all_pool_b():
+    """split_token=0 → no prefix tagged → all tokens go to pool B
+    (this is the default for a request without a first-allocation tag)."""
+    a, b, la, lb = partition_block_table_by_split_token(
+        block_ids=[10, 11, 12], seq_len=40, split_token=0, block_size=16,
+    )
+    assert a == []
+    assert b == [10, 11, 12]
+    assert la == 0
+    assert lb == 40
+
+
+def test_partition_split_ge_seq_len_all_pool_a():
+    """split_token >= seq_len (i.e. all tokens are part of the first
+    prefill chunk) → all blocks go to pool A."""
+    a, b, la, lb = partition_block_table_by_split_token(
+        block_ids=[10, 11, 12], seq_len=40, split_token=40, block_size=16,
+    )
+    assert a == [10, 11, 12]
+    assert b == []
+    assert la == 40
+    assert lb == 0
+
+
+def test_partition_split_aligned_clean_cut():
+    """split_token block-aligned → clean cut, no shared block."""
+    a, b, la, lb = partition_block_table_by_split_token(
+        block_ids=[10, 11, 12, 13], seq_len=64, split_token=32, block_size=16,
+    )
+    assert a == [10, 11]
+    assert b == [12, 13]
+    assert la == 32
+    assert lb == 32
+
+
+def test_partition_split_mid_block_shared_boundary():
+    """split_token lands mid-block → boundary block appears in BOTH lists.
+    The v3_split kernel clips each pool by its seq_len, so this is the
+    correct representation."""
+    a, b, la, lb = partition_block_table_by_split_token(
+        block_ids=[10, 11, 12, 13], seq_len=60, split_token=20, block_size=16,
+    )
+    # split_token=20 lands in block index 1 (block 11), tokens [16..32).
+    # Pool A keeps blocks 10, 11 (covering [0..32) but clipped to 20).
+    # Pool B starts at block 11 (the boundary) and continues 12, 13.
+    assert a == [10, 11]
+    assert b == [11, 12, 13]
+    assert la == 20
+    assert lb == 40
+
+
+def test_partition_split_token_clamped_to_seq_len():
+    """split_token > seq_len gets clamped to seq_len (defensive)."""
+    a, b, la, lb = partition_block_table_by_split_token(
+        block_ids=[10, 11], seq_len=24, split_token=999, block_size=16,
+    )
+    assert a == [10, 11]
+    assert b == []
+    assert la == 24
+    assert lb == 0
+
+
+def test_partition_ignores_block_table_padding():
+    """The runner allocates block-table tensors at a max width; the unused
+    tail is zero-padded. partition() must not include those padded zeros."""
+    a, b, la, lb = partition_block_table_by_split_token(
+        # 3 real blocks; tail is padding (would be 0s from torch.zeros).
+        block_ids=[10, 11, 12, 0, 0, 0, 0],
+        seq_len=40, split_token=0, block_size=16,
+    )
+    assert a == []
+    assert b == [10, 11, 12]  # padding zeros must not appear
+    assert la == 0
+    assert lb == 40
+
+
+def test_partition_rejects_insufficient_blocks():
+    with pytest.raises(ValueError, match="insufficient"):
+        partition_block_table_by_split_token(
+            block_ids=[10], seq_len=40, split_token=0, block_size=16,
+        )
+
+
+def test_partition_rejects_negative_inputs():
+    with pytest.raises(ValueError):
+        partition_block_table_by_split_token(
+            block_ids=[10], seq_len=-1, split_token=0, block_size=16,
+        )
+    with pytest.raises(ValueError):
+        partition_block_table_by_split_token(
+            block_ids=[10], seq_len=16, split_token=-1, block_size=16,
+        )
+    with pytest.raises(ValueError):
+        partition_block_table_by_split_token(
+            block_ids=[10], seq_len=16, split_token=0, block_size=0,
+        )
+
+
+def test_partition_invariant_seq_len_sum():
+    """Property test: pool_a_seq_len + pool_b_seq_len == seq_len, for
+    every split point including the edges."""
+    block_size = 16
+    seq_len = 128
+    block_ids = list(range(100, 100 + (seq_len // block_size)))
+    for split_token in range(0, seq_len + 1):
+        _, _, la, lb = partition_block_table_by_split_token(
+            block_ids=block_ids, seq_len=seq_len,
+            split_token=split_token, block_size=block_size,
+        )
+        assert la + lb == seq_len, f"split_token={split_token}: {la}+{lb}!={seq_len}"

@@ -26,6 +26,7 @@ CacheDType = Literal[
     "fp8_ds_mla",
     "turboquant_k8v4",
     "turboquant_k8v4_nc",
+    "turboquant_k8v4_spec_nc",
     "turboquant_4bit_nc",
     "turboquant_k3v4_nc",
     "turboquant_3bit_nc",

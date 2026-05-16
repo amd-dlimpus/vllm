@@ -268,3 +268,98 @@ def maybe_tag_block_pool(
         cached_len=cached_len,
     )
     return PooledBlockDescriptor(block_id=block_id, pool_id=pool_id)
+
+
+# --- Block-table partitioning (for TurboQuantMetadataBuilder) ------------
+
+
+def partition_block_table_by_split_token(
+    block_ids: list[int],
+    seq_len: int,
+    split_token: int,
+    block_size: int,
+) -> tuple[list[int], list[int], int, int]:
+    """Partition a single request's block-table at a split-token boundary.
+
+    Given a flat block-table for one request (the per-request slice of the
+    runner's block_table tensor) and the absolute token index at which
+    pool A ends, returns the per-pool block-id lists and per-pool seq-len
+    counts that go into ``TurboQuantMetadata``.
+
+    The boundary is **inclusive of the partial block** that contains the
+    split token. Both pools see that block (it carries pool A's prefix
+    tokens up to ``split_token``, and pool B's first dialogue tokens after).
+    This mirrors how the v3_split kernel handles a split that lands in the
+    middle of a block: the same block id appears in both block tables, and
+    the kernel uses ``pool_a_seq_lens`` / ``pool_b_seq_lens`` to clip each
+    pool's contribution to the correct token range.
+
+    Args:
+      block_ids: This request's block ids in order, length =
+        ceil(seq_len / block_size). May contain trailing zero-padding from
+        the runner's max-block-table-width allocation; only the first
+        ``ceil(seq_len / block_size)`` entries are read.
+      seq_len: Total context length for this request (>= 0).
+      split_token: Absolute token index where pool A ends (and pool B
+        begins). ``0`` means "no pool A — all tokens go to pool B"
+        (which is what an in-progress chat without a tagged prefix looks
+        like). ``>= seq_len`` means "no pool B — all tokens are pool A"
+        (which is the very first prefill step).
+      block_size: Tokens per KV block (must be > 0).
+
+    Returns:
+      ``(pool_a_block_ids, pool_b_block_ids, pool_a_seq_len, pool_b_seq_len)``.
+      ``pool_a_seq_len + pool_b_seq_len == seq_len`` always holds.
+
+    Invariants:
+      - When ``split_token == 0``: pool A is empty, pool B contains all
+        ``ceil(seq_len / block_size)`` blocks, pool_a_seq_len = 0.
+      - When ``split_token >= seq_len``: pool A contains all blocks,
+        pool B is empty, pool_b_seq_len = 0.
+      - When ``0 < split_token < seq_len`` and ``split_token`` lands
+        mid-block: the boundary block appears in BOTH lists (kernel
+        clips by seq_len).
+      - When ``split_token`` is block-aligned: no shared block.
+    """
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}")
+    if seq_len < 0:
+        raise ValueError(f"seq_len must be non-negative, got {seq_len}")
+    if split_token < 0:
+        raise ValueError(f"split_token must be non-negative, got {split_token}")
+
+    split_token = min(split_token, seq_len)
+    num_blocks_total = (seq_len + block_size - 1) // block_size
+    if len(block_ids) < num_blocks_total:
+        raise ValueError(
+            f"block_ids length {len(block_ids)} insufficient for "
+            f"seq_len={seq_len} block_size={block_size} "
+            f"(need {num_blocks_total} blocks)"
+        )
+    used_blocks = block_ids[:num_blocks_total]
+
+    if split_token == 0:
+        return [], list(used_blocks), 0, seq_len
+    if split_token >= seq_len:
+        return list(used_blocks), [], seq_len, 0
+
+    # split_token strictly between (0, seq_len): partition at the block
+    # boundary that contains it.
+    num_pool_a_blocks_aligned = split_token // block_size
+    split_lands_mid_block = (split_token % block_size) != 0
+    if split_lands_mid_block:
+        # The boundary block is shared. Pool A keeps blocks [0 .. b], where
+        # b is the boundary-containing block (inclusive). Pool B starts at
+        # the same block b and extends to the end.
+        boundary_block_idx = num_pool_a_blocks_aligned
+        pool_a = list(used_blocks[: boundary_block_idx + 1])
+        pool_b = list(used_blocks[boundary_block_idx:])
+    else:
+        # Clean cut: pool A = [0 .. num_pool_a_blocks_aligned),
+        # pool B = [num_pool_a_blocks_aligned ..]. No shared block.
+        pool_a = list(used_blocks[:num_pool_a_blocks_aligned])
+        pool_b = list(used_blocks[num_pool_a_blocks_aligned:])
+
+    pool_a_seq_len = split_token
+    pool_b_seq_len = seq_len - split_token
+    return pool_a, pool_b, pool_a_seq_len, pool_b_seq_len

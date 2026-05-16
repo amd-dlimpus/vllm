@@ -150,6 +150,18 @@ class Request:
         # True if this request is scheduled as a non-final prefill chunk.
         self.is_prefill_chunk = False
 
+        # Phase 1E (prefix-tier mixed-precision KV): the absolute token
+        # index at which this request's pool-A prefix ends and pool-B
+        # dialogue begins. ``None`` (the default) means the request was
+        # never tagged for two-pool allocation — every block goes to the
+        # legacy single-pool path. ``KVCacheManager.allocate_slots()``
+        # sets this on the very first allocation when
+        # ``VLLM_TQ_PREFIX_TIER=1`` is active. Once set it is immutable:
+        # the prefix-tier policy is static (no mid-session promotion).
+        # Read by ``TurboQuantMetadataBuilder.build()`` to populate the
+        # ``pool_a_*`` / ``pool_b_*`` fields of ``TurboQuantMetadata``.
+        self.prefix_tier_split_token: int | None = None
+
         # The number of NaNs in logits. A value greater than 0
         # indicates that the output is corrupted
         self.num_nans_in_logits = 0

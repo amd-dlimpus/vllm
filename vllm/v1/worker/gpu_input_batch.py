@@ -53,6 +53,12 @@ class CachedRequestState:
     pooling_params: PoolingParams | None = None
     pooling_states: PoolingStates | None = None
 
+    # Phase 1E (prefix-tier mixed-precision KV): forwarded from
+    # ``NewRequestData.prefix_tier_split_token``. ``None`` = untagged
+    # (legacy single-pool path). Read by the runner in `_prepare_inputs`
+    # to populate ``CommonAttentionMetadata.prefix_tier_split_tokens_cpu``.
+    prefix_tier_split_token: int | None = None
+
     def __post_init__(self):
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             self.prompt_token_ids, self.prompt_embeds

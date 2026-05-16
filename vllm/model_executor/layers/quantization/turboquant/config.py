@@ -37,6 +37,20 @@ TQ_PRESETS: dict[str, dict] = {
         "value_quant_bits": 4,
         "norm_correction": True,
     },
+    # Spec-compliant TQ84 (test 1 of phase 2 spec-TQ84 investigation).
+    # 8-bit Lloyd-Max quantized keys + Hadamard rotation + per-token fp16
+    # norm. Distinct from turboquant_k8v4_nc: this preset routes K through
+    # the MSE (Lloyd-Max centroid) path with bits=8, not the bare FP8 cast.
+    # key_storage="mse" forces TurboQuantConfig.key_fp8 to False so the
+    # centroid-lookup pipeline is used (same path TQ44 takes, but with
+    # bits=8 instead of bits=4). Validated against the offline pure-Python
+    # implementation in phase2/analysis/e08_redistribution/variants_tq84_spec.py.
+    "turboquant_k8v4_spec_nc": {
+        "key_quant_bits": 8,
+        "value_quant_bits": 4,
+        "norm_correction": True,
+        "key_storage": "mse",
+    },
     "turboquant_4bit_nc": {
         "key_quant_bits": 4,
         "value_quant_bits": 4,
@@ -103,11 +117,24 @@ class TurboQuantConfig:
     value_quant_bits: int = 4  # 3-4 = uniform quantized values
     seed: int = 42  # kept for backward compatibility; no longer used internally
     norm_correction: bool = False
+    # Routing for K storage when key_quant_bits == 8. "fp8" preserves the
+    # legacy turboquant_k8v4 behaviour (bare bf16->FP8 cast, no rotation, no
+    # quantization). "mse" routes K through the Lloyd-Max centroid path
+    # with bits=key_quant_bits (i.e. spec-TQ84 when key_quant_bits=8).
+    # For key_quant_bits != 8 this field is ignored.
+    key_storage: str = "fp8"
 
     @property
     def key_fp8(self) -> bool:
-        """Whether keys are stored as FP8 — no rotation/quantization needed."""
-        return self.key_quant_bits == 8
+        """Whether keys are stored as FP8 — no rotation/quantization needed.
+
+        Returns True only when both (a) key_quant_bits == 8 and (b) key_storage
+        is "fp8" (the legacy bare-FP8 cast path). When key_storage == "mse"
+        with key_quant_bits == 8, keys are quantized via the 256-centroid
+        Lloyd-Max table (spec-TQ84) and this returns False so the existing
+        MSE pipeline is used.
+        """
+        return self.key_quant_bits == 8 and self.key_storage == "fp8"
 
     @property
     def mse_bits(self) -> int:
@@ -320,6 +347,7 @@ class TurboQuantConfig:
             key_quant_bits=preset["key_quant_bits"],
             value_quant_bits=preset["value_quant_bits"],
             norm_correction=preset["norm_correction"],
+            key_storage=preset.get("key_storage", "fp8"),
         )
 
 

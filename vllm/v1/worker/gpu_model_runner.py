@@ -1165,6 +1165,7 @@ class GPUModelRunner(
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                prefix_tier_split_token=new_req_data.prefix_tier_split_token,
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
@@ -2181,6 +2182,36 @@ class GPUModelRunner(
             causal=True,
             is_prefilling=is_prefilling,
         )
+
+        # Phase 1E (prefix-tier) per-request split-token gather. Only
+        # populated when at least one request in this batch was tagged
+        # by the manager (``Request.prefix_tier_split_token`` is not None
+        # → propagated through ``NewRequestData`` and
+        # ``CachedRequestState``). Untagged rows get the sentinel ``-1``
+        # which the TurboQuant metadata builder reads as "send all tokens
+        # to pool B" — bitwise equivalent to single-pool for that row.
+        # When NO request in the batch is tagged we skip the entire
+        # array allocation so non-prefix-tier batches pay zero cost.
+        if not for_cudagraph_capture:
+            split_tokens_np: np.ndarray | None = None
+            req_ids_slice = self.input_batch.req_ids[:num_reqs]
+            for req_id in req_ids_slice:
+                req_state = self.requests.get(req_id)
+                if req_state is None or req_state.prefix_tier_split_token is None:
+                    continue
+                # First tagged request found: allocate the array (init to
+                # -1 sentinel everywhere, including padded slots).
+                split_tokens_np = np.full(num_reqs_padded, -1, dtype=np.int64)
+                break
+            if split_tokens_np is not None:
+                for i, req_id in enumerate(req_ids_slice):
+                    req_state = self.requests.get(req_id)
+                    if req_state is None:
+                        continue
+                    st = req_state.prefix_tier_split_token
+                    if st is not None:
+                        split_tokens_np[i] = int(st)
+                cm_base.prefix_tier_split_tokens_cpu = split_tokens_np
 
         if self.dcp_world_size > 1:
             self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
@@ -6716,6 +6747,29 @@ class GPUModelRunner(
                                 original_strides[kv_cache_stride_order[i]]
                                 for i in range(5)
                             ]
+                        elif len(kv_cache_shape) == 4:
+                            # TurboQuant layout: (num_blocks, block_size, heads, slot)
+                            # Pre-permutation shape semantics. With padded pages
+                            # the num_blocks stride is elements_per_page (skips
+                            # the per-page gap); inner strides are dense.
+                            original_shape = [
+                                kv_cache_shape[inv_order[i]] for i in range(4)
+                            ]
+                            original_strides = [
+                                elements_per_page,  # num_blocks stride
+                                original_shape[2] * original_shape[3],  # block_size
+                                original_shape[3],  # heads stride
+                                1,  # slot stride
+                            ]
+                            permuted_strides = [
+                                original_strides[kv_cache_stride_order[i]]
+                                for i in range(4)
+                            ]
+                        else:
+                            raise RuntimeError(
+                                f"Padded KV reshape only implemented for 4D/5D "
+                                f"layouts; got shape={kv_cache_shape}"
+                            )
 
                         logger.info(
                             "[DEBUG KV RESHAPE PADDED] layer=%s: "

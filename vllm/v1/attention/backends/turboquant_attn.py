@@ -47,6 +47,10 @@ from vllm.v1.attention.backends.fa_utils import (
     is_flash_attn_varlen_func_available,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.core.two_pool_kv_cache import (
+    is_prefix_tier_enabled,
+    partition_block_table_by_split_token,
+)
 from vllm.v1.attention.ops.triton_turboquant_decode import (
     _tq_full_dequant_kv,
     _use_fp8_e4b15,
@@ -122,6 +126,8 @@ class TurboQuantAttentionBackend(AttentionBackend):
     ]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "turboquant_k8v4",
+        "turboquant_k8v4_nc",
+        "turboquant_k8v4_spec_nc",
         "turboquant_4bit_nc",
         "turboquant_k3v4_nc",
         "turboquant_3bit_nc",
@@ -134,7 +140,14 @@ class TurboQuantAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [16, 32, 64, 128]
+        # Accept any multiple of 16 so hybrid models that LCM-pad the
+        # spec.block_size (e.g. mixed per-layer dtype on Qwen3.5-MoE) can
+        # use kernel_block_size == spec.block_size, avoiding the
+        # _reshape_kv_cache_tensors as_strided pattern that can't express
+        # non-uniform inter-block strides under padded pages.
+        # The TQ kernels read block_size dynamically from kv_cache.shape[1],
+        # so they work with any value.
+        return [MultipleOf(16)]
 
     @classmethod
     def supports_attn_type(cls, attn_type: str) -> bool:
@@ -287,6 +300,19 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
             cam, decode_threshold=self.reorder_batch_threshold
         )
 
+        # Phase 1E (prefix-tier) two-pool fields. Populated iff the runner
+        # passed a non-None ``prefix_tier_split_tokens_cpu`` on the common
+        # metadata AND the env flag is on. Otherwise we leave them None
+        # and dispatch falls through to the legacy single-pool path.
+        (
+            pool_a_block_table,
+            pool_b_block_table,
+            pool_a_seq_lens,
+            pool_b_seq_lens,
+            max_pool_a,
+            max_pool_b,
+        ) = self._maybe_build_two_pool_fields(cam)
+
         return TurboQuantMetadata(
             seq_lens=cam.seq_lens,
             slot_mapping=cam.slot_mapping,
@@ -298,6 +324,107 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
             is_prefill=(cam.max_query_len > 1),
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
+            pool_a_block_table=pool_a_block_table,
+            pool_b_block_table=pool_b_block_table,
+            pool_a_seq_lens=pool_a_seq_lens,
+            pool_b_seq_lens=pool_b_seq_lens,
+            max_pool_a_seq_len=max_pool_a,
+            max_pool_b_seq_len=max_pool_b,
+        )
+
+    def _maybe_build_two_pool_fields(
+        self, cam: CommonAttentionMetadata
+    ) -> tuple[
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        int,
+        int,
+    ]:
+        """Build the Phase 1E pool-A / pool-B tensors when the runner has
+        tagged at least one request with a non-None split-token.
+
+        Returns ``(None, None, None, None, 0, 0)`` (legacy single-pool) if:
+          * ``VLLM_TQ_PREFIX_TIER`` is off, OR
+          * ``cam.prefix_tier_split_tokens_cpu`` is None, OR
+          * every entry in ``prefix_tier_split_tokens_cpu`` is the sentinel
+            ``-1`` (no request in the batch is tagged).
+
+        The shared-boundary case (split lands mid-block) is handled by
+        ``partition_block_table_by_split_token``: the boundary block id
+        appears in BOTH block tables, and the kernel clips by per-pool
+        seq_lens. This matches the v3_split kernel's semantics.
+        """
+        if not is_prefix_tier_enabled():
+            return None, None, None, None, 0, 0
+        split_tokens = cam.prefix_tier_split_tokens_cpu
+        if split_tokens is None:
+            return None, None, None, None, 0, 0
+        if cam.num_reqs == 0:
+            return None, None, None, None, 0, 0
+
+        block_size = self.kv_cache_spec.block_size
+        # Block table on CPU once for partitioning; the per-request slices
+        # are small so this is far cheaper than per-row CPU sync.
+        block_table_cpu = cam.block_table_tensor.cpu().numpy()
+        seq_lens_cpu = (
+            cam._seq_lens_cpu
+            if cam._seq_lens_cpu is not None
+            else cam.seq_lens.cpu()
+        ).numpy()
+        max_blocks = block_table_cpu.shape[1]
+
+        # Pre-allocate pool block tables at max_blocks width; pad with 0.
+        # We track each request's actual pool-A/pool-B widths so the
+        # kernel can clip by seq_lens.
+        pool_a_bt = [[0] * max_blocks for _ in range(cam.num_reqs)]
+        pool_b_bt = [[0] * max_blocks for _ in range(cam.num_reqs)]
+        pool_a_sl = [0] * cam.num_reqs
+        pool_b_sl = [0] * cam.num_reqs
+        any_two_pool = False
+
+        for i in range(cam.num_reqs):
+            split = int(split_tokens[i])
+            if split < 0:
+                # Sentinel: request not tagged. Send all tokens to pool B
+                # so the kernel sees a uniform-codec request — this keeps
+                # mixed-batch (tagged + untagged) safe and bitwise
+                # equivalent to single-pool for untagged rows.
+                seq_len = int(seq_lens_cpu[i])
+                num_blocks = (seq_len + block_size - 1) // block_size
+                pool_b_bt[i][:num_blocks] = block_table_cpu[i, :num_blocks].tolist()
+                pool_b_sl[i] = seq_len
+                continue
+
+            any_two_pool = True
+            seq_len = int(seq_lens_cpu[i])
+            pa, pb, la, lb = partition_block_table_by_split_token(
+                block_ids=block_table_cpu[i].tolist(),
+                seq_len=seq_len,
+                split_token=split,
+                block_size=block_size,
+            )
+            pool_a_bt[i][: len(pa)] = pa
+            pool_b_bt[i][: len(pb)] = pb
+            pool_a_sl[i] = la
+            pool_b_sl[i] = lb
+
+        if not any_two_pool:
+            return None, None, None, None, 0, 0
+
+        device = cam.block_table_tensor.device
+        pool_a_bt_t = torch.tensor(pool_a_bt, dtype=torch.int32, device=device)
+        pool_b_bt_t = torch.tensor(pool_b_bt, dtype=torch.int32, device=device)
+        pool_a_sl_t = torch.tensor(pool_a_sl, dtype=torch.int32, device=device)
+        pool_b_sl_t = torch.tensor(pool_b_sl, dtype=torch.int32, device=device)
+        return (
+            pool_a_bt_t,
+            pool_b_bt_t,
+            pool_a_sl_t,
+            pool_b_sl_t,
+            max(pool_a_sl) if pool_a_sl else 0,
+            max(pool_b_sl) if pool_b_sl else 0,
         )
 
 
@@ -508,8 +635,39 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # batches under two-pool aren't in MVP scope; if the metadata
         # builder ever sets two-pool fields on a mixed batch we fall
         # through to single-pool below to avoid silent miscompiles.
-        if attn_metadata.is_two_pool() and num_decodes == N:
-            # Pure decode under two-pool — use v3_split kernel.
+        # Phase 1E MVP gate: only fire the v3_split two-pass kernel when
+        # the runner has actually allocated DISTINCT physical KV pools
+        # (Phase 1F). In MVP mode both pools share the incoming
+        # ``kv_cache``; the two-pass merge is then mathematically
+        # equivalent to a single pass over the union block table — but
+        # it costs 2× shared memory (which blows past MI300's 64 KB
+        # limit on models with head_dim=256, e.g. Qwen3.5-35B). Falling
+        # through to the single-pool branch with the original
+        # block_table is numerically equivalent and uses the
+        # production-tested kernel.
+        physical_two_pool = (
+            attn_metadata.is_two_pool()
+            and attn_metadata.pool_a_kv_cache is not None
+            and attn_metadata.pool_b_kv_cache is not None
+            and attn_metadata.pool_a_kv_cache.data_ptr()
+            != attn_metadata.pool_b_kv_cache.data_ptr()
+        )
+        # One-shot observability so server logs record whether the
+        # process is running with distinct physical pools (Phase 1F
+        # landed) or falling back to single-pool storage.
+        if not getattr(type(self), "_phase1e_dispatch_decision_logged", False):
+            if attn_metadata.is_two_pool():
+                logger.info(
+                    "Phase 1E dispatch decision: is_two_pool=True "
+                    "physical_two_pool=%s → %s (await Phase 1F for "
+                    "distinct physical pools)",
+                    physical_two_pool,
+                    "v3_split" if (physical_two_pool and num_decodes == N)
+                    else "single-pool fallback",
+                )
+                type(self)._phase1e_dispatch_decision_logged = True
+        if physical_two_pool and num_decodes == N:
+            # Pure decode under two-pool with distinct physical pools.
             attn_out = self._decode_attention_split(
                 q, attn_metadata, Pi, centroids, PiT, layer,
             )
@@ -1451,10 +1609,29 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         Codec: pool A and pool B share ``self.tq_config`` in this MVP.
         Codec-mixing (pool A = TQ84, pool B = TQ44) requires per-pool
         ``tq_config`` plumbing that's tracked separately.
+
+        Implementation dispatch (Phase 1F):
+          * Default → v4 fused single-accumulator kernel (one launch, one
+            (M, L, acc) state across both pools; SMEM-aware BLOCK_M;
+            unblocks head_dim>=256 which v3_split couldn't do).
+          * ``VLLM_TQ_USE_V3_SPLIT_FALLBACK=1`` → legacy v3_split (two
+            single-pool launches + host-side LSE merge). Kept as a
+            fallback for ablation / debug. Numerical equivalence between
+            v3_split and v4_fused at head_dim<=128 is asserted in
+            ``tests/v1/attention/ops/test_turboquant_v4_fused.py``.
         """
-        from vllm.v1.attention.ops.triton_turboquant_unified_attention import (
-            triton_turboquant_unified_attention_split,
-        )
+        import os as _os
+
+        _use_fallback = _os.environ.get("VLLM_TQ_USE_V3_SPLIT_FALLBACK", "0") == "1"
+        if _use_fallback:
+            from vllm.v1.attention.ops.triton_turboquant_unified_attention import (
+                triton_turboquant_unified_attention_split as _two_pool_launcher,
+            )
+        else:
+            from vllm.v1.attention.ops.triton_turboquant_unified_attention_two_pool import (  # noqa: E501
+                triton_turboquant_unified_attention_two_pool_fused
+                as _two_pool_launcher,
+            )
 
         B = query.shape[0]
         device = query.device
@@ -1483,7 +1660,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 "(or one of them) to be set on TurboQuantMetadata; got both None"
             )
 
-        return triton_turboquant_unified_attention_split(
+        return _two_pool_launcher(
             query=query,
             pool_a_kv_cache=pool_a_kv,
             pool_b_kv_cache=pool_b_kv,

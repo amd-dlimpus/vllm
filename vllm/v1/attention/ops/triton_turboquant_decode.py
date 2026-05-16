@@ -22,6 +22,33 @@ from vllm.v1.attention.ops.triton_decode_attention import (
 _FP8_E4B15: dict[int, int] = {}
 
 
+def kv_cache_flat_u16(kv_cache: torch.Tensor) -> torch.Tensor:
+    """Return a contiguous flat uint16 view of `kv_cache`'s underlying byte
+    storage, including any inter-block padding bytes.
+
+    Required for hybrid-model LCM-padded KV caches where the 4D
+    `kv_cache` tensor is non-contiguous (built via `torch.as_strided` so
+    `stride(0) > block_size * H * slot_bytes`). On such tensors a plain
+    `.view(torch.uint16)` or `.view(-1)` raises:
+        "view size is not compatible with input tensor's size and stride"
+    because the view would need to span the padding gap between blocks.
+
+    The TQ kernels only need a *base pointer* + `stride_cache_block`
+    arithmetic; they never iterate the full flat shape. So we construct
+    a 1D byte view (length = `storage_nbytes`, stride = 1) directly off
+    the underlying `UntypedStorage`, then alias it as uint16. The kernel
+    skips the padding bytes correctly via its stride math.
+
+    For contiguous TQ caches (the common, non-hybrid case) this is
+    equivalent to `kv_cache.view(torch.uint16)`.
+    """
+    stor = kv_cache.untyped_storage()
+    n_bytes = stor.nbytes()
+    flat = torch.empty(0, dtype=torch.uint8, device=kv_cache.device)
+    flat.set_(stor, storage_offset=0, size=(n_bytes,), stride=(1,))
+    return flat.view(torch.uint16)
+
+
 def _use_fp8_e4b15(device: int = 0) -> int:
     """Return 1 if device needs fp8e4b15 (Ampere/Ada, SM < 8.9), else 0.
     On non-CUDA platforms (e.g. XPU), always returns 0 (use e4nv format).
@@ -406,19 +433,26 @@ def _tq_full_dequant_kv(
             k_recon = k_raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
         tl.store(K_out_ptr + ko_base + d_offs, k_recon.to(tl.float16), mask=d_mask)
     else:
-        mse_bit_off = d_offs * MSE_BITS
-        mse_byte_idx = mse_bit_off // 8
-        mse_bit_shift = mse_bit_off % 8
-        mse_umask = (1 << MSE_BITS) - 1
+        if MSE_BITS == 8:
+            # Spec-TQ84 path: 256 centroids -> 1 byte per element, no bit-packing
+            # and no cross-byte read. Mirrors store kernel's MSE_BITS==8 branch.
+            mse_idx = tl.load(
+                KV_cache_ptr + data_base + d_offs, mask=d_mask, other=0
+            ).to(tl.int32)
+        else:
+            mse_bit_off = d_offs * MSE_BITS
+            mse_byte_idx = mse_bit_off // 8
+            mse_bit_shift = mse_bit_off % 8
+            mse_umask = (1 << MSE_BITS) - 1
 
-        mse_raw0 = tl.load(
-            KV_cache_ptr + data_base + mse_byte_idx, mask=d_mask, other=0
-        ).to(tl.int32)
-        mse_raw1 = tl.load(
-            KV_cache_ptr + data_base + mse_byte_idx + 1, mask=d_mask, other=0
-        ).to(tl.int32)
-        raw16_key = mse_raw0 | (mse_raw1 << 8)
-        mse_idx = (raw16_key >> mse_bit_shift) & mse_umask
+            mse_raw0 = tl.load(
+                KV_cache_ptr + data_base + mse_byte_idx, mask=d_mask, other=0
+            ).to(tl.int32)
+            mse_raw1 = tl.load(
+                KV_cache_ptr + data_base + mse_byte_idx + 1, mask=d_mask, other=0
+            ).to(tl.int32)
+            raw16_key = mse_raw0 | (mse_raw1 << 8)
+            mse_idx = (raw16_key >> mse_bit_shift) & mse_umask
 
         k_mse = tl.load(Centroids_ptr + mse_idx, mask=d_mask, other=0.0)
 
@@ -542,7 +576,7 @@ def triton_turboquant_decode_attention(
     soa_k_norm = 0
     soa_v_scale = 0 if key_fp8 else 1
     soa_v_zero = 1 if key_fp8 else 2
-    kv_cache_u16 = kv_cache.view(torch.uint16)
+    kv_cache_u16 = kv_cache_flat_u16(kv_cache)
 
     # Compute q_rot = q @ Pi.T (rotated query for MSE key scoring)
     # FP8 path: pass query directly (float16); kernel casts inline.

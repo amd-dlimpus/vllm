@@ -172,7 +172,18 @@ def _tq_load_k_tile(
         K = k_f32  # [TILE_SIZE, HEAD_SIZE_PADDED]
     else:
         # MSE path: gather packed key indices + centroid LUT.
-        if MSE_BITS == 4 and USE_PAIR_LUT:
+        if MSE_BITS == 8:
+            # Spec-TQ84 path: 256 centroids -> 1 byte per element, no bit-packing.
+            # Mirrors the store kernel's MSE_BITS==8 branch: each d_offs lane
+            # corresponds to exactly one byte at data_bases[t] + d_offs[d].
+            mse_addrs = data_bases[:, None] + d_offs[None, :]
+            if UNMASKED:
+                mse_idx = tl.load(KV_cache_ptr + mse_addrs, mask=d_mask[None, :], other=0).to(tl.int32)
+                c_vals = tl.load(Centroids_ptr + mse_idx, mask=d_mask[None, :], other=0.0)
+            else:
+                mse_idx = tl.load(KV_cache_ptr + mse_addrs, mask=tile_mask[:, None] & d_mask[None, :], other=0).to(tl.int32)
+                c_vals = tl.load(Centroids_ptr + mse_idx, mask=tile_mask[:, None] & d_mask[None, :], other=0.0)
+        elif MSE_BITS == 4 and USE_PAIR_LUT:
             # FLUTE pair-LUT fast path — load each packed byte once, decode
             # both nibbles, single 3-D gather returns (T[lo], T[hi]) per byte.
             HALF_D: tl.constexpr = BLOCK_D // 2
@@ -1218,7 +1229,8 @@ def triton_turboquant_unified_attention(
     # V-scale / V-zero live in a contiguous per-block metadata region and are
     # always 2-byte aligned, so single-instruction u16 loads replace the
     # original 2× uint8 + OR sequence for every per-token metadata fetch.
-    kv_cache_u16 = kv_cache.view(torch.uint16)
+    from vllm.v1.attention.ops.triton_turboquant_decode import kv_cache_flat_u16
+    kv_cache_u16 = kv_cache_flat_u16(kv_cache)
 
     # Opt#3 SoA layout constants (derived locally; matches the store-side
     # computation so the launcher signature stays unchanged). Invariant:

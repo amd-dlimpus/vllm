@@ -388,6 +388,19 @@ class CommonAttentionMetadata:
     (num_computed_tokens < num_prompt_tokens). Used by some backends to
     distinguish actual decodes from short extends."""
 
+    # Phase 1E (prefix-tier mixed-precision KV). Per-request absolute
+    # token index at which pool A (high-precision prefix) ends and pool B
+    # (low-precision dialogue) begins. ``None`` (default) means the
+    # request was never tagged for two-pool allocation — every block goes
+    # to the legacy single-pool path. Only the TurboQuant backend reads
+    # this; other backends ignore it.
+    # Source: ``Request.prefix_tier_split_token``, populated by
+    # ``KVCacheManager.allocate_slots()`` when ``VLLM_TQ_PREFIX_TIER=1``.
+    # Population in the runner is a follow-up (see Phase 1E §4 in the
+    # report); for unit-testing the builder, construct this field
+    # directly with shape (num_reqs,) int64 on CPU.
+    prefix_tier_split_tokens_cpu: np.ndarray | None = None
+
     # WARNING: Deprecated fields. Will be removed in a future release (v0.15.0)
     _seq_lens_cpu: torch.Tensor | None = None
     _num_computed_tokens_cpu: torch.Tensor | None = None

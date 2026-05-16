@@ -428,6 +428,29 @@ class KVCacheManager:
             num_encoder_tokens,
         )
 
+        # Phase 1E (prefix-tier): tag the request's split-token on the very
+        # first allocation. The split point separates pool A (prefix /
+        # codebase / cache-hit content) from pool B (new dialogue / decode
+        # growth). Once set, it is never changed — the policy is static.
+        # When the env flag is off this branch is a no-op and behavior is
+        # bitwise identical to the legacy single-pool path.
+        if (
+            self._prefix_tier_enabled
+            and request.prefix_tier_split_token is None
+            and request.num_computed_tokens == 0
+        ):
+            cache_hit_tokens = (
+                num_new_computed_tokens + num_external_computed_tokens
+            )
+            if cache_hit_tokens > 0:
+                # Turn 2+: prefix came in via the cache; that's pool A.
+                # The newly-prefilled delta is pool B.
+                request.prefix_tier_split_token = cache_hit_tokens
+            else:
+                # Turn 1 (or any uncached fresh prompt): the whole prompt
+                # is the codebase prefix. Decode-time growth goes to pool B.
+                request.prefix_tier_split_token = request.num_prompt_tokens
+
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
         if not self.enable_caching or delay_cache_blocks:

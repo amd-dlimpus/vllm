@@ -15,7 +15,10 @@ import math
 import torch
 
 from vllm.triton_utils import tl, triton
-from vllm.v1.attention.ops.triton_turboquant_decode import _use_fp8_e4b15
+from vllm.v1.attention.ops.triton_turboquant_decode import (
+    _use_fp8_e4b15,
+    kv_cache_flat_u16,
+)
 
 # ═══════════════════════════════════════════════════════════════════════
 # Shared: value uniform quantization + pack + SoA scale/zero store
@@ -332,7 +335,16 @@ def _tq_fused_store_mse(
     idx = tl.minimum(lo, N_CENTROIDS - 1)
 
     # ── 2. PACK MSE INDICES into data region at data_base[0:MSE_BYTES] ──
-    if MSE_BITS == 4:
+    if MSE_BITS == 8:
+        # Spec-TQ84 path: 256 centroids -> 1 byte per element, no bit-packing.
+        # MSE_BYTES == D, d_offs already covers exactly the bytes we need.
+        tl.store(
+            KV_cache_ptr + data_base + d_offs,
+            idx.to(tl.uint8),
+            mask=d_mask,
+        )
+
+    elif MSE_BITS == 4:
         idx_pairs = tl.reshape(idx, [BLOCK_D // 2, 2])
         shifts_4 = tl.arange(0, 2) * 4
         packed = tl.sum((idx_pairs & 0xF) << shifts_4[None, :], axis=1).to(tl.uint8)
@@ -461,11 +473,12 @@ def triton_turboquant_store(
     soa_v_scale = 0 if key_fp8 else 1
     soa_v_zero = 1 if key_fp8 else 2
 
-    # uint16-aliased view of the same storage — enables single-instruction
-    # u16 writes for the SoA K-norm / V-scale / V-zero stores. The cache
-    # bytes are always contiguous and 2-byte aligned under the Opt#3 layout
-    # (MSE_BYTES, VAL_DATA_BYTES, meta_region_offset are all even).
-    kv_cache_u16 = kv_cache.view(torch.uint16)
+    # Flat byte view + uint16-aliased view. See
+    # `vllm.v1.attention.ops.triton_turboquant_decode.kv_cache_flat_u16`
+    # for why this is needed under hybrid-model LCM-padded layouts (the
+    # 4D `kv_cache` may be non-contiguous and `.view(...)` would fail).
+    kv_cache_u16 = kv_cache_flat_u16(kv_cache)
+    kv_cache_flat = kv_cache_u16.view(torch.uint8)
 
     # ── FP8 PATH: in-kernel FP8 cast + scatter via fp8 kernel ──
     if key_fp8:
@@ -485,8 +498,8 @@ def triton_turboquant_store(
         _tq_fused_store_fp8[grid](
             k_flat,
             v_flat,
-            kv_cache.view(-1),
-            kv_cache_u16.view(-1),
+            kv_cache_flat,
+            kv_cache_u16,
             slot_mapping,
             stride_cache_block=stride_block,
             D=D,
@@ -533,8 +546,8 @@ def triton_turboquant_store(
         v_flat,
         midpoints,
         centroids_ptr,
-        kv_cache.view(-1),
-        kv_cache_u16.view(-1),
+        kv_cache_flat,
+        kv_cache_u16,
         slot_mapping,
         stride_cache_block=stride_block,
         D=D,
