@@ -978,6 +978,42 @@ def _get_pit_in_query_dtype(PiT: torch.Tensor, qdtype: torch.dtype) -> torch.Ten
     return cached
 
 
+def _assert_tq_output(out, *, kernel: str, extra: str = "") -> None:
+    """Output-side sanity assertions (env-gated).
+
+    Enabled when ``VLLM_TQ_DEBUG_ASSERTS=1``. Catches NaN/Inf and
+    out-of-bound magnitudes coming out of the TQ attention launchers
+    so that latent dequant/attention math failures surface as a Python
+    AssertionError with traceback instead of a silent worker death.
+    """
+    if os.environ.get("VLLM_TQ_DEBUG_ASSERTS") != "1":
+        return
+    # out may be (output, lse) tuple for return_lse path
+    t = out[0] if isinstance(out, tuple) else out
+    has_nan = bool(torch.isnan(t).any().item())
+    has_inf = bool(torch.isinf(t).any().item())
+    if has_nan or has_inf:
+        nan_count = int(torch.isnan(t).sum().item())
+        inf_count = int(torch.isinf(t).sum().item())
+        flat = t.flatten()
+        sample = flat[:8].detach().to(torch.float32).cpu().tolist()
+        raise AssertionError(
+            f"[VLLM_TQ_DEBUG_ASSERTS] {kernel}: NaN/Inf in output. "
+            f"nan={nan_count} inf={inf_count} shape={tuple(t.shape)} "
+            f"dtype={t.dtype} sample_first8={sample} {extra}"
+        )
+    amax = float(t.detach().abs().max().item())
+    if amax > 1e4:
+        # Find a few offending values for diagnosis.
+        flat = t.detach().abs().flatten()
+        topk = torch.topk(flat, k=min(8, flat.numel())).values.to(torch.float32).cpu().tolist()
+        raise AssertionError(
+            f"[VLLM_TQ_DEBUG_ASSERTS] {kernel}: output magnitude {amax:g} "
+            f"exceeds 1e4 bound. shape={tuple(t.shape)} dtype={t.dtype} "
+            f"top8_abs={topk} {extra}"
+        )
+
+
 def triton_turboquant_unified_attention(
     query: torch.Tensor,  # [num_tokens, Hq, D] - fp16/bf16
     kv_cache: torch.Tensor,  # [num_blocks, block_size, Hk, padded_slot] uint8
@@ -1332,7 +1368,9 @@ def triton_turboquant_unified_attention(
             num_stages=num_stages,
         )
         if return_lse:
+            _assert_tq_output((output, output_lse), kernel="unified.2d_return_lse")
             return output, output_lse
+        _assert_tq_output(output, kernel="unified.2d")
         return output
 
     # ---------------- 3D split-KV path ----------------
@@ -1442,6 +1480,7 @@ def triton_turboquant_unified_attention(
         NUM_SEGMENTS_PER_SEQ=num_segments,
         USE_FP8=False,
     )
+    _assert_tq_output(output, kernel="unified.3d")
     return output
 
 
@@ -1771,4 +1810,5 @@ def triton_turboquant_unified_attention_split(
     # above; nan_to_num is a cheap safety net.
     merged = torch.nan_to_num(merged, nan=0.0, posinf=0.0, neginf=0.0)
     output.copy_(merged.to(qdtype))
+    _assert_tq_output(output, kernel="unified_split")
     return output

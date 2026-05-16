@@ -9,6 +9,7 @@ Supports FP8 (E4M3) keys, 3-bit and 4-bit uniform quantized values.
 """
 
 import math
+import os
 from typing import Any
 
 import torch
@@ -534,6 +535,34 @@ def _get_layout(D, mse_bits, value_quant_bits, key_packed_size):
     return cfg
 
 
+def _assert_tq_output(out, *, kernel: str, extra: str = "") -> None:
+    """Output-side sanity assertions (env-gated, mirrors unified)."""
+    if os.environ.get("VLLM_TQ_DEBUG_ASSERTS") != "1":
+        return
+    t = out[0] if isinstance(out, tuple) else out
+    has_nan = bool(torch.isnan(t).any().item())
+    has_inf = bool(torch.isinf(t).any().item())
+    if has_nan or has_inf:
+        nan_count = int(torch.isnan(t).sum().item())
+        inf_count = int(torch.isinf(t).sum().item())
+        flat = t.flatten()
+        sample = flat[:8].detach().to(torch.float32).cpu().tolist()
+        raise AssertionError(
+            f"[VLLM_TQ_DEBUG_ASSERTS] {kernel}: NaN/Inf in output. "
+            f"nan={nan_count} inf={inf_count} shape={tuple(t.shape)} "
+            f"dtype={t.dtype} sample_first8={sample} {extra}"
+        )
+    amax = float(t.detach().abs().max().item())
+    if amax > 1e4:
+        flat = t.detach().abs().flatten()
+        topk = torch.topk(flat, k=min(8, flat.numel())).values.to(torch.float32).cpu().tolist()
+        raise AssertionError(
+            f"[VLLM_TQ_DEBUG_ASSERTS] {kernel}: output magnitude {amax:g} "
+            f"exceeds 1e4 bound. shape={tuple(t.shape)} dtype={t.dtype} "
+            f"top8_abs={topk} {extra}"
+        )
+
+
 def triton_turboquant_decode_attention(
     query: torch.Tensor,  # [B, Hq, D] — original query
     kv_cache: torch.Tensor,  # [num_blocks, block_size, Hk, padded_slot] uint8
@@ -699,4 +728,5 @@ def triton_turboquant_decode_attention(
         num_stages=2,
     )
 
+    _assert_tq_output(output, kernel="decode")
     return output  # already in query dtype
