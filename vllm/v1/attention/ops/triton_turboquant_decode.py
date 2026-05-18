@@ -58,26 +58,6 @@ def _tq_tuple_log(site, num_tokens, num_seqs, block_table, seq_lens):
     except Exception:
         pass
 # ---- /TQ_TUPLE_LOG ----
-# ---- TQ_FORCE_SYNC (env-gated workaround for cap=4096 silent crash) ----
-_TQ_FORCE_SYNC_ENABLED = os.environ.get('VLLM_TQ_FORCE_SYNC', '0') == '1'
-def _tq_force_sync(block_table=None, seq_lens=None):
-    # Mirrors the bug-killing implicit D->H sync from the tuple logger.
-    # Using .item() rather than torch.cuda.synchronize() because the
-    # naive synchronize was observed to hang during the engine boot
-    # profile_run (probe_5_validate_sync). The .item() calls only run
-    # if the tensors are populated, which the boot-time dummy forward
-    # may or may not provide; the try/except keeps boot safe.
-    if not _TQ_FORCE_SYNC_ENABLED:
-        return
-    try:
-        if block_table is not None and block_table.numel() > 0:
-            _ = (block_table >= 0).sum().item()
-        if seq_lens is not None and seq_lens.numel() > 0:
-            _ = int(seq_lens.max().item())
-            _ = int(seq_lens.sum().item())
-    except Exception:
-        pass
-# ---- /TQ_FORCE_SYNC ----
 
 
 def kv_cache_flat_u16(kv_cache: torch.Tensor) -> torch.Tensor:
@@ -666,7 +646,6 @@ def triton_turboquant_decode_attention(
     B, Hq, D = query.shape
     Hk = kv_cache.shape[2]
     _tq_tuple_log("decode", B, B, block_table, seq_lens)
-    _tq_force_sync(block_table, seq_lens)
 
     block_size = kv_cache.shape[1]
     kv_group_size = Hq // Hk
