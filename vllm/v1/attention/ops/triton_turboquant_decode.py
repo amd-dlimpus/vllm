@@ -23,6 +23,43 @@ from vllm.v1.attention.ops.triton_decode_attention import (
 _FP8_E4B15: dict[int, int] = {}
 
 
+
+# ---- TQ_TUPLE_LOG (env-gated, written by debug probe) ----
+_TQ_TUPLE_LOG_ENABLED = os.environ.get('VLLM_TQ_TUPLE_LOG', '0') == '1'
+_TQ_TUPLE_STEP_COUNTER = [0]
+def _tq_tuple_log(site, num_tokens, num_seqs, block_table, seq_lens):
+    if not _TQ_TUPLE_LOG_ENABLED:
+        return
+    try:
+        import sys as _sys, time as _time
+        try:
+            kv_pages = int((block_table >= 0).sum().item()) if block_table is not None else -1
+        except Exception:
+            kv_pages = -2
+        try:
+            max_seq = int(seq_lens.max().item()) if seq_lens is not None and seq_lens.numel() > 0 else -1
+            sum_seq = int(seq_lens.sum().item()) if seq_lens is not None and seq_lens.numel() > 0 else -1
+        except Exception:
+            max_seq, sum_seq = -2, -2
+        _TQ_TUPLE_STEP_COUNTER[0] += 1
+        step = _TQ_TUPLE_STEP_COUNTER[0]
+        ts = _time.time()
+        parts = ['[TQ_TUPLE]',
+                 'step=' + str(step),
+                 'site=' + str(site),
+                 'num_tokens=' + str(num_tokens),
+                 'num_seqs=' + str(num_seqs),
+                 'kv_pages=' + str(kv_pages),
+                 'max_seq=' + str(max_seq),
+                 'sum_seq=' + str(sum_seq),
+                 'ts=' + ('%.6f' % ts)]
+        _sys.stderr.write(' '.join(parts) + chr(10))
+        _sys.stderr.flush()
+    except Exception:
+        pass
+# ---- /TQ_TUPLE_LOG ----
+
+
 def kv_cache_flat_u16(kv_cache: torch.Tensor) -> torch.Tensor:
     """Return a contiguous flat uint16 view of `kv_cache`'s underlying byte
     storage, including any inter-block padding bytes.
@@ -597,6 +634,8 @@ def triton_turboquant_decode_attention(
     """
     B, Hq, D = query.shape
     Hk = kv_cache.shape[2]
+    _tq_tuple_log("decode", B, B, block_table, seq_lens)
+
     block_size = kv_cache.shape[1]
     kv_group_size = Hq // Hk
     device = query.device
