@@ -150,8 +150,8 @@ def _tq_decode_stage1_v2(
     if not KEY_FP8:
         if MSE_BITS == 4:
             pass  # 4-bit byte extraction is computed inline in the tile loop
-        else:
-            # Generic bit extraction
+        elif MSE_BITS != 8:
+            # Generic bit extraction (not needed for 8-bit: 1 byte per element)
             mse_bit_off = d_offs * MSE_BITS
             mse_byte_idx = mse_bit_off // 8
             mse_bit_shift = mse_bit_off % 8
@@ -288,6 +288,20 @@ def _tq_decode_stage1_v2(
                     other=0,
                 ).to(tl.int32)
                 mse_idx = (mse_raw >> nibble_shift[None, :]) & 0xF
+                c_vals = tl.load(
+                    Centroids_ptr + mse_idx,
+                    mask=kv_mask_1d[:, None] & d_mask[None, :],
+                    other=0.0,
+                )
+            elif MSE_BITS == 8:
+                # Spec-TQ84: 1 byte per element, direct load (no bit-packing).
+                # Avoids OOB read from the generic raw16 path (mse_addrs0+1).
+                mse_addrs = data_bases[:, None] + d_offs[None, :]
+                mse_idx = tl.load(
+                    KV_cache_ptr + mse_addrs,
+                    mask=kv_mask_1d[:, None] & d_mask[None, :],
+                    other=0,
+                ).to(tl.int32)
                 c_vals = tl.load(
                     Centroids_ptr + mse_idx,
                     mask=kv_mask_1d[:, None] & d_mask[None, :],
