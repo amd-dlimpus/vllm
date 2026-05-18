@@ -205,10 +205,11 @@ def _tq_decode_stage1(
 
     # Precompute byte/bit index vectors for MSE gather loads
     if not KEY_FP8:
-        mse_bit_off = d_offs * MSE_BITS
-        mse_byte_idx = mse_bit_off // 8
-        mse_bit_shift = mse_bit_off % 8
-        mse_mask = (1 << MSE_BITS) - 1
+        if MSE_BITS != 8:
+            mse_bit_off = d_offs * MSE_BITS
+            mse_byte_idx = mse_bit_off // 8
+            mse_bit_shift = mse_bit_off % 8
+            mse_mask = (1 << MSE_BITS) - 1
 
     # Precompute value bit/byte index vectors (loop-invariant)
     if VQB == 3:
@@ -299,19 +300,29 @@ def _tq_decode_stage1(
             scores = tl.where(kv_mask, scores, -float("inf"))
         else:
             # MSE unpack + norms
-            mse_addrs0 = data_bases[:, None] + mse_byte_idx[None, :]
-            mse_raw0 = tl.load(
-                KV_cache_ptr + mse_addrs0,
-                mask=kv_mask[:, None] & d_mask[None, :],
-                other=0,
-            ).to(tl.int32)
-            mse_raw1 = tl.load(
-                KV_cache_ptr + mse_addrs0 + 1,
-                mask=kv_mask[:, None] & d_mask[None, :],
-                other=0,
-            ).to(tl.int32)
-            raw16 = mse_raw0 | (mse_raw1 << 8)
-            mse_idx = (raw16 >> mse_bit_shift[None, :]) & mse_mask
+            if MSE_BITS == 8:
+                # Spec-TQ84: 1 byte per element, direct load (no bit-packing).
+                # Avoids OOB read from the generic raw16 path (mse_addrs0+1).
+                mse_addrs = data_bases[:, None] + d_offs[None, :]
+                mse_idx = tl.load(
+                    KV_cache_ptr + mse_addrs,
+                    mask=kv_mask[:, None] & d_mask[None, :],
+                    other=0,
+                ).to(tl.int32)
+            else:
+                mse_addrs0 = data_bases[:, None] + mse_byte_idx[None, :]
+                mse_raw0 = tl.load(
+                    KV_cache_ptr + mse_addrs0,
+                    mask=kv_mask[:, None] & d_mask[None, :],
+                    other=0,
+                ).to(tl.int32)
+                mse_raw1 = tl.load(
+                    KV_cache_ptr + mse_addrs0 + 1,
+                    mask=kv_mask[:, None] & d_mask[None, :],
+                    other=0,
+                ).to(tl.int32)
+                raw16 = mse_raw0 | (mse_raw1 << 8)
+                mse_idx = (raw16 >> mse_bit_shift[None, :]) & mse_mask
 
             # Centroid gather + dot product
             c_vals = tl.load(
