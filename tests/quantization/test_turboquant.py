@@ -80,6 +80,22 @@ PRESET_EXPECTED = {
         key_packed_size=66, value_packed_size=36,
         slot_size=102, slot_size_aligned=102,
     ),
+    "turboquant_k8v4_nc": dict(
+        key_fp8=True,  key_quant_bits=8,
+        key_mse_bits=0, value_quant_bits=4,
+        mse_bits=4, n_centroids=16, centroid_bits=4,
+        norm_correction=True,
+        key_packed_size=128, value_packed_size=68,
+        slot_size=196, slot_size_aligned=196,
+    ),
+    "turboquant_k8v4_spec_nc": dict(
+        key_fp8=False, key_quant_bits=8,
+        key_mse_bits=8, value_quant_bits=4,
+        mse_bits=8, n_centroids=256, centroid_bits=8,
+        norm_correction=True,
+        key_packed_size=130, value_packed_size=68,
+        slot_size=198, slot_size_aligned=198,
+    ),
 }
 # fmt: on
 
@@ -177,7 +193,7 @@ class TestTurboQuantConfig:
             assert cfg.key_quant_bits == 8
         else:
             assert cfg.key_mse_bits > 0
-            assert cfg.key_quant_bits in (3, 4)
+            assert cfg.key_quant_bits in (3, 4, 8)
 
     @pytest.mark.parametrize("preset", ALL_PRESETS)
     @pytest.mark.parametrize("head_dim", [64, 96, 128, 256])
