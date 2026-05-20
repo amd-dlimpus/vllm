@@ -58,26 +58,6 @@ def _tq_tuple_log(site, num_tokens, num_seqs, block_table, seq_lens):
     except Exception:
         pass
 # ---- /TQ_TUPLE_LOG ----
-# ---- TQ_FORCE_SYNC (env-gated workaround for cap=4096 silent crash) ----
-_TQ_FORCE_SYNC_ENABLED = os.environ.get('VLLM_TQ_FORCE_SYNC', '0') == '1'
-def _tq_force_sync(block_table=None, seq_lens=None):
-    # Mirrors the bug-killing implicit D->H sync from the tuple logger.
-    # Using .item() rather than torch.cuda.synchronize() because the
-    # naive synchronize was observed to hang during the engine boot
-    # profile_run (probe_5_validate_sync). The .item() calls only run
-    # if the tensors are populated, which the boot-time dummy forward
-    # may or may not provide; the try/except keeps boot safe.
-    if not _TQ_FORCE_SYNC_ENABLED:
-        return
-    try:
-        if block_table is not None and block_table.numel() > 0:
-            _ = (block_table >= 0).sum().item()
-        if seq_lens is not None and seq_lens.numel() > 0:
-            _ = int(seq_lens.max().item())
-            _ = int(seq_lens.sum().item())
-    except Exception:
-        pass
-# ---- /TQ_FORCE_SYNC ----
 
 
 def kv_cache_flat_u16(kv_cache: torch.Tensor) -> torch.Tensor:
@@ -205,10 +185,11 @@ def _tq_decode_stage1(
 
     # Precompute byte/bit index vectors for MSE gather loads
     if not KEY_FP8:
-        mse_bit_off = d_offs * MSE_BITS
-        mse_byte_idx = mse_bit_off // 8
-        mse_bit_shift = mse_bit_off % 8
-        mse_mask = (1 << MSE_BITS) - 1
+        if MSE_BITS != 8:
+            mse_bit_off = d_offs * MSE_BITS
+            mse_byte_idx = mse_bit_off // 8
+            mse_bit_shift = mse_bit_off % 8
+            mse_mask = (1 << MSE_BITS) - 1
 
     # Precompute value bit/byte index vectors (loop-invariant)
     if VQB == 3:
@@ -299,19 +280,29 @@ def _tq_decode_stage1(
             scores = tl.where(kv_mask, scores, -float("inf"))
         else:
             # MSE unpack + norms
-            mse_addrs0 = data_bases[:, None] + mse_byte_idx[None, :]
-            mse_raw0 = tl.load(
-                KV_cache_ptr + mse_addrs0,
-                mask=kv_mask[:, None] & d_mask[None, :],
-                other=0,
-            ).to(tl.int32)
-            mse_raw1 = tl.load(
-                KV_cache_ptr + mse_addrs0 + 1,
-                mask=kv_mask[:, None] & d_mask[None, :],
-                other=0,
-            ).to(tl.int32)
-            raw16 = mse_raw0 | (mse_raw1 << 8)
-            mse_idx = (raw16 >> mse_bit_shift[None, :]) & mse_mask
+            if MSE_BITS == 8:
+                # Spec-TQ84: 1 byte per element, direct load (no bit-packing).
+                # Avoids OOB read from the generic raw16 path (mse_addrs0+1).
+                mse_addrs = data_bases[:, None] + d_offs[None, :]
+                mse_idx = tl.load(
+                    KV_cache_ptr + mse_addrs,
+                    mask=kv_mask[:, None] & d_mask[None, :],
+                    other=0,
+                ).to(tl.int32)
+            else:
+                mse_addrs0 = data_bases[:, None] + mse_byte_idx[None, :]
+                mse_raw0 = tl.load(
+                    KV_cache_ptr + mse_addrs0,
+                    mask=kv_mask[:, None] & d_mask[None, :],
+                    other=0,
+                ).to(tl.int32)
+                mse_raw1 = tl.load(
+                    KV_cache_ptr + mse_addrs0 + 1,
+                    mask=kv_mask[:, None] & d_mask[None, :],
+                    other=0,
+                ).to(tl.int32)
+                raw16 = mse_raw0 | (mse_raw1 << 8)
+                mse_idx = (raw16 >> mse_bit_shift[None, :]) & mse_mask
 
             # Centroid gather + dot product
             c_vals = tl.load(
@@ -655,7 +646,6 @@ def triton_turboquant_decode_attention(
     B, Hq, D = query.shape
     Hk = kv_cache.shape[2]
     _tq_tuple_log("decode", B, B, block_table, seq_lens)
-    _tq_force_sync(block_table, seq_lens)
 
     block_size = kv_cache.shape[1]
     kv_group_size = Hq // Hk
