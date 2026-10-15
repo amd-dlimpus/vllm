@@ -113,7 +113,9 @@ def test_decode_and_prefill_take_the_triton_route():
     )
 
     decode = dict(num_prefills=0, num_decodes=8, num_decode_tokens=8, max_query_len=1)
-    prefill = dict(num_prefills=2, num_decodes=0, num_decode_tokens=0, max_query_len=128)
+    prefill = dict(
+        num_prefills=2, num_decodes=0, num_decode_tokens=0, max_query_len=128
+    )
     for step in (decode, prefill):
         assert _use_rocm_sparse_triton(
             kv_cache_dtype="mxfp4_mla", head_size=LATENT, kv_lora_rank=LATENT, **step
