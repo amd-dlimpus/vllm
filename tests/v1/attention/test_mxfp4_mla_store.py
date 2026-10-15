@@ -27,17 +27,19 @@ def test_store_matches_aiter():
     from vllm.v1.attention.ops.mxfp4_mla_store import store_mxfp4_mla
 
     set_random_seed(0)
-    num_blocks, block_size, gap = 3, 8, 5
+    num_blocks, block_size, gap = 8, 8, 5
     backing = torch.full(
         (num_blocks, block_size + gap, ROW), UNTOUCHED, dtype=torch.uint8
     ).cuda()
     cache = backing[:, :block_size]
 
+    # 64 tokens, two of them padding; two slots are never written.
     num_slots = num_blocks * block_size
-    wide = torch.randn(num_slots + 2, 2 * LATENT, dtype=torch.bfloat16)
+    wide = torch.randn(num_slots, 2 * LATENT, dtype=torch.bfloat16)
     wide[:, ::97] *= 8.0
     latent = wide.cuda()[:, :LATENT]
-    slots = torch.cat([torch.randperm(num_slots), torch.tensor([-1, -1])])
+    written = torch.randperm(num_slots)[: num_slots - 2]
+    slots = torch.cat([written, torch.tensor([-1, -1])])
 
     store_mxfp4_mla(latent, slots.cuda(), cache)
 
@@ -50,8 +52,10 @@ def test_store_matches_aiter():
         dim=1,
     )
     got = backing.cpu()
-    for token, slot in enumerate(slots.tolist()):
-        if slot >= 0:
-            block, offset = divmod(slot, block_size)
-            assert torch.equal(got[block, offset], want[token]), f"slot {slot}"
+    for token, slot in enumerate(written.tolist()):
+        block, offset = divmod(slot, block_size)
+        assert torch.equal(got[block, offset], want[token]), f"slot {slot}"
+    for slot in set(range(num_slots)) - set(written.tolist()):
+        block, offset = divmod(slot, block_size)
+        assert (got[block, offset] == UNTOUCHED).all(), f"slot {slot} was written"
     assert (got[:, block_size:] == UNTOUCHED).all(), "a write landed between blocks"
