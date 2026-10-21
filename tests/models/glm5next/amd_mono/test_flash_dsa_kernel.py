@@ -29,6 +29,8 @@ MAX_LEN = 8192
 # tokens of each row including the new one (0: padding); 4100, 1500, 7000, 64 and
 # 6200 complete a pool, 2050 / 2049 / 3333 keep a 2 / 1 / 1-token tail
 LENS = (4100, 1500, 2050, 7000, 2049, 64, 3333)
+# per-layer FP8 KV scale (_k_scale); not a power of two, so the division rounds
+KV_SCALE = 0.037
 
 
 def _bf16(w):
@@ -165,7 +167,7 @@ class _Caches:
     """Random caches for S requests of up to MAX_LEN tokens, the block table, and
     the step's row table."""
 
-    def __init__(self, S: int, device, seed: int) -> None:
+    def __init__(self, S: int, device, seed: int, kv_fp8: bool = False) -> None:
         from vllm.models.glm5next.amd.ops.mono.config import INDEX_DIM, KV_LORA
         from vllm.models.glm5next.amd.ops.mono.ffn.layout import ROW_WORDS
 
@@ -174,7 +176,15 @@ class _Caches:
         nb = 1 + S * per
         ipb = BLOCK // 4
         self.ipb = ipb
-        self.kv = torch.randn(nb, BLOCK, KV_LORA, generator=g, device=device).bfloat16()
+        kv = torch.randn(nb, BLOCK, KV_LORA, generator=g, device=device)
+        self.kv_scale = None
+        if kv_fp8:
+            # vLLM's "fp8" cache: uint8 E4M3FN bytes of x / _k_scale
+            self.kv_scale = torch.tensor(KV_SCALE, dtype=torch.float32, device=device)
+            q = (kv.bfloat16().float() / KV_SCALE).clamp(-448, 448)
+            self.kv = q.to(torch.float8_e4m3fn).view(torch.uint8)
+        else:
+            self.kv = kv.bfloat16()
         vals = (torch.randn(nb, ipb, INDEX_DIM, generator=g, device=device) * 64).clamp(
             -448, 448
         )
@@ -211,7 +221,16 @@ class _Caches:
     def caches(self):
         from vllm.models.glm5next.amd.ops.mono.ffn.op import FlashDsaCaches
 
-        return FlashDsaCaches(self.kv, self.idx, self.tail)
+        return FlashDsaCaches(self.kv, self.idx, self.tail, self.kv_scale)
+
+    def latent(self, kv=None) -> torch.Tensor:
+        """f32 latent rows as an attention kernel reads them; FP8 as vLLM's Triton
+        sparse MLA dequantizes it: bf16(f32(fp8) * _k_scale)."""
+        kv = self.kv if kv is None else kv
+        if self.kv_scale is None:
+            return kv.float()
+        deq = kv.view(torch.float8_e4m3fn).float() * self.kv_scale
+        return deq.bfloat16().float()
 
     def clone(self):
         c = object.__new__(_Caches)
@@ -235,7 +254,7 @@ def _rms(x, w, eps=1e-5):
     ).bfloat16()
 
 
-def _check(rank: int, tp: int, device, fp8) -> None:
+def _check(rank: int, tp: int, device, fp8, kv_fp8: bool = False) -> None:
     import torch.distributed as dist
     import torch.nn.functional as F
 
@@ -278,6 +297,7 @@ def _check(rank: int, tp: int, device, fp8) -> None:
             dsa=True,
             max_pools=max_pools,
             dsa_fp8=fp8,
+            kv_fp8=kv_fp8,
         )
         op = FlashFfnOp(rt, lay.weights(), 0, dsa=dsa.weights())
         g = lay.g
@@ -287,7 +307,7 @@ def _check(rank: int, tp: int, device, fp8) -> None:
         comb = torch.softmax(
             torch.randn(S, HC_MULT, HC_MULT, generator=g, device=device), -1
         )
-        cache = _Caches(S, device, seed=10 + S)
+        cache = _Caches(S, device, seed=10 + S, kv_fp8=kv_fp8)
         before = cache.clone()
         rows, live = cache.rows, S - 1
         pos = rows[:, 0].long()
@@ -341,9 +361,12 @@ def _check(rank: int, tp: int, device, fp8) -> None:
         assert _rel(q_an, _rms(qa, dsa.g_qa)) < 1e-2, f"S={S}: q_a norm"
         kv_want = _rms(kva, dsa.g_kv)
         flat_kv = cache.kv.view(-1, KV_LORA)
+        # E4M3 rounds each value by ~2.4% RMS, on top of the bf16 row's 1e-2
+        kv_tol = 4e-2 if kv_fp8 else 1e-2
         for r in range(live):
-            got_row = flat_kv[int(rows[r, 1])]
-            assert _rel(got_row, kv_want[r]) < 1e-2, f"S={S} row {r}: KV cache row"
+            got_row = cache.latent(flat_kv[int(rows[r, 1])])
+            e = _rel(got_row, kv_want[r])
+            assert e < kv_tol, f"S={S} row {r}: KV cache row {e}"
         changed = before.kv.view(-1, KV_LORA).ne(flat_kv).any(-1)
         assert int(changed.sum()) <= live, f"S={S}: stray MLA cache writes"
 
@@ -459,7 +482,7 @@ def _check(rank: int, tp: int, device, fp8) -> None:
                 continue
             toks = torch.arange(L, device=device) if L <= TOPK_TOKENS else sel[r].long()
             blk = cache.bt[r, toks // BLOCK].long()
-            kvr = cache.kv[blk, toks % BLOCK].float()  # [T, 512]
+            kvr = cache.latent(cache.kv[blk, toks % BLOCK])  # [T, 512]
             sc = torch.einsum("hl,tl->ht", q_lat[r].float(), kvr) * MLA_SCALE
             o_lat = (torch.softmax(sc, -1) @ kvr).bfloat16().float()
             want = torch.einsum("hl,hvl->hv", o_lat, dsa.w_uv.float())
@@ -522,12 +545,24 @@ FORMATS = {
 
 @pytest.mark.skipif(not _on_cdna4(), reason="the Flash MonoKernel targets CDNA4")
 @pytest.mark.parametrize(
-    "tp, fmt", [(2, "mixed"), (4, "fp8"), (4, "bf16"), (8, "mixed")]
+    "tp, fmt, kv",
+    [
+        (2, "mixed", "bf16"),
+        (4, "fp8", "bf16"),
+        (4, "bf16", "bf16"),
+        (8, "mixed", "bf16"),
+        (2, "mixed", "fp8"),
+        (4, "fp8", "fp8"),
+    ],
 )
-def test_dsa_layer_matches_vllm_ops(monkeypatch: pytest.MonkeyPatch, tp: int, fmt: str):
+def test_dsa_layer_matches_vllm_ops(
+    monkeypatch: pytest.MonkeyPatch, tp: int, fmt: str, kv: str
+):
     from ....utils import multi_process_parallel
 
     if torch.accelerator.device_count() < tp:
         pytest.skip(f"needs {tp} GPUs")
     pytest.importorskip("flydsl")
-    multi_process_parallel(monkeypatch, tp, 1, _worker(_check, FORMATS[fmt]))
+    multi_process_parallel(
+        monkeypatch, tp, 1, _worker(_check, FORMATS[fmt], kv == "fp8")
+    )

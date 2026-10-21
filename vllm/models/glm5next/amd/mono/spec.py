@@ -23,6 +23,8 @@ WIDTHS = (2, 4, 8)
 # wider steps at these TP sizes are slower than vLLM's path
 TP_MAX_WIDTH = {2: 4}
 STEP_TOKENS = (1, 2, 4, 8)
+# the MLA latent cache: bf16, or E4M3FN with vLLM's per-layer _k_scale
+KV_CACHE_DTYPES = ("auto", "bfloat16", "fp8", "fp8_e4m3")
 GRID = 256
 NUMERICS = (
     "expert inputs quantized to MXFP8 (vLLM: MXFP4)",
@@ -95,8 +97,10 @@ def refuse_config(vllm_config: VllmConfig) -> list[str]:
         reasons.append("needs tensor parallel size 2, 4 or 8")
     if vllm_config.parallel_config.use_sequence_parallel_moe:
         reasons.append("sequence-parallel MoE")
-    if vllm_config.cache_config.cache_dtype not in ("auto", "bfloat16"):
-        reasons.append(f"{vllm_config.cache_config.cache_dtype} KV cache (needs bf16)")
+    if vllm_config.cache_config.cache_dtype not in KV_CACHE_DTYPES:
+        reasons.append(
+            f"{vllm_config.cache_config.cache_dtype} KV cache (needs bf16 or fp8_e4m3)"
+        )
     ssm = getattr(vllm_config.cache_config, "mamba_ssm_cache_dtype", "auto")
     if ssm not in ("auto", "float32"):
         reasons.append(f"{ssm} KDA recurrent state (needs float32)")
@@ -123,7 +127,12 @@ MONO_SPEC = MonoSpec(
         "conv": CacheReq("self_attn.kv_cache[0]", (torch.bfloat16,), when=is_kda),
         "rec": CacheReq("self_attn.kv_cache[1]", (torch.float32,), when=is_kda),
         "mla": CacheReq(
-            "self_attn.mla_attn.mla_attn.kv_cache", (torch.bfloat16,), when=is_dsa
+            "self_attn.mla_attn.mla_attn.kv_cache",
+            (torch.bfloat16, torch.uint8, torch.float8_e4m3fn),
+            when=is_dsa,
+        ),
+        "kscale": CacheReq(
+            "self_attn.mla_attn.mla_attn._k_scale", (torch.float32,), when=is_dsa
         ),
         "icache": CacheReq(
             "self_attn.indexer.k_cache.kv_cache", (torch.uint8,), when=is_dsa

@@ -159,6 +159,7 @@ def build_flash_ffn_kernel(
     dsa: bool = False,
     max_pools: int = 0,
     dsa_fp8: tuple[bool, bool, bool] = (True, True, True),
+    kv_fp8: bool = False,
 ):
     """Return the ``@flyc.jit`` launcher of one rank's FFN layer for S rows; with
     ``kda`` the whole KDA decoder layer (attention-side mHC, projections, short conv,
@@ -167,6 +168,9 @@ def build_flash_ffn_kernel(
     LoRA projections and norms, KV cache write, kpool indexer, sparse MLA, o_proj)
     for rows of at most ``max_pools`` kpool pools. ``dsa_fp8`` says which of q_a | kv_a,
     q_b and o_proj are FP8 with 128 x 128 block scales (else row-major bf16).
+    With ``kv_fp8`` the MLA latent cache holds E4M3FN values of one per-layer scale
+    (``kv_scale``, vLLM's ``_k_scale``): rows are written as vLLM's cache write does
+    and dequantized to bf16 as they are loaded for the split attention.
 
     ``poll_limit`` bounds the re-polls of every mailbox wait. An expired wait
     stores 1 into its stage's error word (``poll_err_addr``) and, with TP peers,
@@ -189,6 +193,7 @@ def build_flash_ffn_kernel(
     HG = MH // WAVES
     QB_ROWS = MH * NOPE_DIM
     QKV8, QB8, O8 = dsa_fp8
+    KV_BYTES = 1 if kv_fp8 else 2
     whole = kda or dsa
     FAULT = abi.fault_spec()
     expert_inter = inter
@@ -1631,6 +1636,8 @@ def build_flash_ffn_kernel(
             r_gkv = _rsrc(tv["g_kv"])
             r_lnw, r_lnb = _rsrc(tv["ln_w"]), _rsrc(tv["ln_b"])
             r_ape = _rsrc(tv["ape"])
+            if const_expr(kv_fp8):
+                kv_scale = ld_f32(_rsrc(tv["kv_scale"]), 0)
             for t in range(start("cache"), S, G):
                 s = fx.Int32(t)
                 stamp("cache")
@@ -1653,10 +1660,28 @@ def build_flash_ffn_kernel(
                 if slot >= 0:
                     row_addr = tv["kv_cache"] + (
                         fx.Int64(slot // KVB) * KVE + fx.Int64((slot % KVB) * KV_LORA)
-                    ) * fx.Int64(2)
-                    bo.buffer_store(
-                        fx.Float32(kv * rstd * g).to(fx.BFloat16), _rsrc(row_addr), tid
-                    )
+                    ) * fx.Int64(KV_BYTES)
+                    if const_expr(kv_fp8):
+                        # vLLM's FP8 cache write: saturate(f32(bf16(x)) / k_scale)
+                        q8 = div(bf16_round(kv * rstd * g), kv_scale)
+                        q8 = fx.min(fx.max(q8, -FP8_MAX), FP8_MAX)
+                        w8 = (
+                            fx.Int32(
+                                rocdl.cvt_pk_fp8_f32(
+                                    T.i32, q8, _xshfl(q8, 1), fx.Int32(0), False
+                                )
+                            )
+                            & 0xFFFF
+                        )
+                        w8n = _xshfl(w8, 2)
+                        if lane % 4 == 0:
+                            bo.buffer_store(w8 | (w8n << 16), _rsrc(row_addr), tid // 4)
+                    else:
+                        bo.buffer_store(
+                            fx.Float32(kv * rstd * g).to(fx.BFloat16),
+                            _rsrc(row_addr),
+                            tid,
+                        )
                 mean = block_sum(lk.select(kraw, fx.Float32(0.0))) * (1.0 / INDEX_DIM)
                 cen = lk.select(kraw - mean, fx.Float32(0.0))
                 var = block_sum(cen * cen) * (1.0 / INDEX_DIM)
@@ -2401,6 +2426,8 @@ def build_flash_ffn_kernel(
             KVE = tv["kv_block_elems"]
             r_bt = _rsrc(tv["block_table"])
             KPW = SPLIT_KEYS // WAVES
+            if const_expr(kv_fp8):
+                kv_scale = ld_f32(_rsrc(tv["kv_scale"]), 0)
             ktile = xs + KT_OFF
             pl = xs  # q is dead once the scores are in ``red``
             for tt in range(start("split"), S * HG * N_SPLIT, G):
@@ -2453,11 +2480,28 @@ def build_flash_ffn_kernel(
                         r_row = _rsrc(
                             tv["kv_cache"]
                             + (fx.Int64(blk) * KVE + fx.Int64(off * KV_LORA))
-                            * fx.Int64(2)
+                            * fx.Int64(KV_BYTES)
                         )
-                        raw = fx.Vector(
-                            bo.buffer_load(r_row, lane * 4, vec_width=4, dtype=T.i32)
-                        )
+                        # lane: latent values 8 lane .. 8 lane + 7, as bf16 pairs
+                        if const_expr(kv_fp8):
+                            raw8 = fx.Vector(
+                                bo.buffer_load(
+                                    r_row, lane * 2, vec_width=2, dtype=T.i32
+                                )
+                            )
+                            # vLLM's sparse MLA dequant: bf16(f32(fp8) * k_scale);
+                            # the converts' own scale may keep only an exponent
+                            deq = _fp8_to_bf16x8(raw8[0], raw8[1])
+                            raw = fx.Vector.from_elements(
+                                [fx.Float32(deq[i]) * kv_scale for i in range(8)],
+                                fx.Float32,
+                            ).to(fx.BFloat16)
+                        else:
+                            raw = fx.Vector(
+                                bo.buffer_load(
+                                    r_row, lane * 4, vec_width=4, dtype=T.i32
+                                )
+                            )
                         fx.ptr_store(
                             raw.bitcast(fx.Float32), ktile + (j * QS + lane * 4)
                         )

@@ -48,7 +48,7 @@ def test_refusals_are_reported_at_once():
     reasons = spec.refuse_config(
         _flash_config(
             tp=16,
-            cache="fp8",
+            cache="fp8_e5m2",
             ssm="bfloat16",
             spec=object(),
             hf={"hidden_size": 2048, "hc_mult": 2},
@@ -58,7 +58,7 @@ def test_refusals_are_reported_at_once():
         "needs hidden_size 4096",
         "needs hc_mult 4",
         "tensor parallel size",
-        "fp8 KV cache",
+        "fp8_e5m2 KV cache",
         "bfloat16 KDA recurrent state",
         "speculative decoding",
     )
@@ -66,10 +66,42 @@ def test_refusals_are_reported_at_once():
         assert any(w in r for r in reasons), (w, reasons)
 
 
-def test_supported_geometry_has_no_model_reasons():
-    reasons = spec.refuse_config(_flash_config())
+@pytest.mark.parametrize("cache", ["auto", "bfloat16", "fp8", "fp8_e4m3"])
+def test_supported_geometry_has_no_model_reasons(cache: str):
+    reasons = spec.refuse_config(_flash_config(cache=cache))
     # only the platform may refuse off ROCm / off gfx950
     assert all(r in ("needs ROCm", "needs gfx950") for r in reasons), reasons
+
+
+def _dsa_caches(kv_dtype, scale=None):
+    nb = 3
+    return {
+        "5.mla": torch.zeros(nb, 64, 512, dtype=kv_dtype),
+        "5.icache": torch.zeros(nb, 16, 132, dtype=torch.uint8),
+        "5.tail": torch.zeros(nb, 2, 4, 128, dtype=torch.bfloat16),
+        "5.kscale": torch.tensor(1.0) if scale is None else scale,
+    }
+
+
+@pytest.mark.parametrize("kv_dtype", [torch.uint8, torch.float8_e4m3fn])
+def test_fp8_mla_cache_binds_with_its_scale(kv_dtype):
+    pytest.importorskip("flydsl")
+    caches = _dsa_caches(kv_dtype, torch.tensor(0.5))
+    out, reasons = kernel._bind_dsa(caches, fp8=True)
+    assert not reasons, reasons
+    assert out[5].kv_scale is caches["5.kscale"]
+    out, reasons = kernel._bind_dsa(_dsa_caches(torch.bfloat16), fp8=False)
+    assert not reasons and out[5].kv_scale is None
+
+
+def test_mla_cache_dtype_must_match_the_config():
+    pytest.importorskip("flydsl")
+    _, reasons = kernel._bind_dsa(_dsa_caches(torch.bfloat16), fp8=True)
+    assert any("needs FP8" in r for r in reasons), reasons
+    _, reasons = kernel._bind_dsa(_dsa_caches(torch.uint8), fp8=False)
+    assert any("needs bf16" in r for r in reasons), reasons
+    _, reasons = kernel._bind_dsa(_dsa_caches(torch.uint8, torch.ones(2)), fp8=True)
+    assert any("_k_scale of 2 values" in r for r in reasons), reasons
 
 
 def test_layer_kinds():

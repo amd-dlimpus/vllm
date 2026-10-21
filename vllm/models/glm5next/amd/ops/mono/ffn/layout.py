@@ -103,6 +103,7 @@ DSA_TAB = (
     "idx_block_pools",
     "tail_block_elems",
     "tail_gate_elems",
+    "kv_scale",
 )
 
 N_ROW_TILES = HIDDEN // ROW_TILE

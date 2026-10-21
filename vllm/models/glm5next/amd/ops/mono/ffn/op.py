@@ -18,6 +18,9 @@ from vllm.models.glm5next.amd.ops.mono.ffn.layout import (
     ROW_WORDS,
 )
 
+# vLLM allocates an "fp8" / "fp8_e4m3" cache as uint8 and views it as E4M3FN
+KV_FP8_DTYPES = (torch.uint8, torch.float8_e4m3fn)
+
 
 @dataclass
 class FlashFfnWeights:
@@ -101,14 +104,16 @@ class FlashDsaWeights:
 
 @dataclass
 class FlashDsaCaches:
-    """One sparse-attention layer's caches: the bf16 MLA latent cache
-    [blocks, block_tokens, 512] (block stride may be padded), the uint8 index
-    cache [blocks, block_tokens / 4, 132] (pool FP8 values, then f32 scales) and
-    the bf16 kpool tail ring [blocks, 2, 4, 128] (k, gate)."""
+    """One sparse-attention layer's caches: the MLA latent cache
+    [blocks, block_tokens, 512] (block stride may be padded), bf16, or E4M3FN bytes
+    (uint8 or float8_e4m3fn) of the f32 scalar ``kv_scale``; the uint8 index cache
+    [blocks, block_tokens / 4, 132] (pool FP8 values, then f32 scales) and the bf16
+    kpool tail ring [blocks, 2, 4, 128] (k, gate)."""
 
     kv_cache: torch.Tensor
     idx_cache: torch.Tensor
     tail_cache: torch.Tensor
+    kv_scale: torch.Tensor | None = None
 
 
 @dataclass
@@ -149,10 +154,11 @@ class FlashFfnRuntime:
         dsa: bool = False,
         max_pools: int = 0,
         dsa_fp8: tuple[bool, bool, bool] = (True, True, True),
+        kv_fp8: bool = False,
     ) -> None:
         self.width, self.rank, self.npes = width, rank, npes
         self.kda, self.dsa, self.max_pools = kda, dsa, max_pools
-        self.dsa_fp8 = dsa_fp8
+        self.dsa_fp8, self.kv_fp8 = dsa_fp8, kv_fp8
         self.launch, self.sc, self.sy = build_flash_ffn_kernel(
             width,
             rank=rank,
@@ -166,6 +172,7 @@ class FlashFfnRuntime:
             dsa=dsa,
             max_pools=max_pools,
             dsa_fp8=dsa_fp8,
+            kv_fp8=kv_fp8,
         )
         dev = torch.device("cuda", torch.cuda.current_device())
         self.peer = PeerBuffers(self.sy["_bytes"], rank, npes, group)
@@ -261,6 +268,18 @@ class FlashFfnOp:
         d, c = self.dsa, caches
         assert d is not None and self.tab is not None
         kv, idx, tail = c.kv_cache, c.idx_cache, c.tail_cache
+        if self.rt.kv_fp8:
+            if kv.dtype not in KV_FP8_DTYPES:
+                raise ValueError(
+                    f"an FP8 KV runtime needs an E4M3FN cache, got {kv.dtype}"
+                )
+            scale = c.kv_scale
+            if scale is None or scale.dtype != torch.float32 or scale.numel() != 1:
+                raise ValueError("an FP8 KV runtime needs kv_scale as one f32 value")
+            if scale.device != kv.device:
+                raise ValueError(f"kv_scale on {scale.device}, cache on {kv.device}")
+        elif kv.dtype != torch.bfloat16:
+            raise ValueError(f"a bf16 KV runtime needs a bf16 cache, got {kv.dtype}")
         values = {
             **{
                 name: 0 if getattr(d, name) is None else getattr(d, name).data_ptr()
@@ -279,6 +298,7 @@ class FlashFfnOp:
             "idx_block_pools": idx.shape[1],
             "tail_block_elems": tail.stride(0),
             "tail_gate_elems": tail.stride(1),
+            "kv_scale": c.kv_scale.data_ptr() if self.rt.kv_fp8 else 0,
         }
         host = [values[name] for name in DSA_TAB]
         if host != self._tab_host:
