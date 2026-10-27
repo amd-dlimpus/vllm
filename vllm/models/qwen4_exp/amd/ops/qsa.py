@@ -12,10 +12,17 @@ from vllm import _custom_ops as ops
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
-from .mxfp4_kv import block_records, head_dim_from_record_bytes, mxfp4_dequant_rows
+from .mxfp4_kv import (
+    block_records,
+    e4m3_quantize_rows,
+    head_dim_from_record_bytes,
+    mxfp4_dequant_rows,
+)
 
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
+# TEMP(tuning): (block_n, splits, warps) forced for mxfp4; remove before commit.
+_MXFP4_PROFILE_OVERRIDE: tuple[int, int, int] | None = None
 
 
 @triton.jit
@@ -187,6 +194,62 @@ def _expand_qsa_indices_kernel(
 
 
 @triton.jit
+def _mxfp4_pv_group(
+    acc,
+    probabilities,
+    alpha,
+    base,
+    record,
+    valid,
+    GROUP: tl.constexpr,
+    BLOCK_RECORDS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    """One 32-column head_dim slice of P x V on gfx950's scaled MFMA.
+
+    The MFMA scales operands along the reduction (token) axis, but V's E8M0
+    scales run along head_dim. So each token's scale for this slice is folded
+    into P, which is then quantized to E4M3 with one scale per 32 tokens, and
+    V's E2M1 codes go in as stored: two head_dim values per byte.
+    """
+    HALF_D: tl.constexpr = HEAD_DIM // 2
+    GROUPS: tl.constexpr = HEAD_DIM // 32
+    v_scale = tl.load(
+        base + BLOCK_RECORDS * (HEAD_DIM + GROUPS) + record * GROUPS + GROUP,
+        mask=valid,
+        other=127,
+    )
+    fold = (v_scale.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+    p_codes, p_scales = e4m3_quantize_rows(probabilities * fold[None, :])
+    v_codes = tl.load(
+        base[:, None]
+        + BLOCK_RECORDS * HALF_D
+        + record[:, None] * HALF_D
+        + GROUP * 16
+        + tl.arange(0, 16)[None, :],
+        mask=valid[:, None],
+        other=0,
+    )
+    return tl.dot_scaled(
+        p_codes,
+        p_scales,
+        "e4m3",
+        v_codes,
+        None,
+        "e2m1",
+        acc=acc * alpha[:, None],
+        rhs_k_pack=False,
+    )
+
+
+@triton.jit
+def _cat_columns(a, b):
+    ROWS: tl.constexpr = a.shape[0]
+    COLS: tl.constexpr = a.shape[1]
+    return tl.reshape(tl.permute(tl.join(a, b), (0, 2, 1)), (ROWS, 2 * COLS))
+
+
+@triton.jit
 def _qsa_sparse_paged_gqa_splitk_kernel(
     q_ptr,
     k_cache_ptr,
@@ -227,6 +290,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     MXFP4_BLOCK_RECORDS: tl.constexpr = 0,
     MXFP4_DOT_SCALED: tl.constexpr = False,
     MXFP4_HW_CVT: tl.constexpr = False,
+    MXFP4_NATIVE_QK: tl.constexpr = False,
+    MXFP4_NATIVE_PV: tl.constexpr = False,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -250,6 +315,19 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     max_value = tl.full((BLOCK_M,), -1.0e20, dtype=tl.float32)
     normalizer = tl.zeros((BLOCK_M,), dtype=tl.float32)
     accumulator = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
+    if MXFP4_NATIVE_QK:
+        q_codes, q_scales = e4m3_quantize_rows(query.to(tl.float32))
+    if MXFP4_NATIVE_PV:
+        # One accumulator per 32-column slice; see _mxfp4_pv_group.
+        tl.static_assert(HEAD_DIM == 256)
+        acc0 = tl.zeros((BLOCK_M, 32), dtype=tl.float32)
+        acc1 = tl.zeros((BLOCK_M, 32), dtype=tl.float32)
+        acc2 = tl.zeros((BLOCK_M, 32), dtype=tl.float32)
+        acc3 = tl.zeros((BLOCK_M, 32), dtype=tl.float32)
+        acc4 = tl.zeros((BLOCK_M, 32), dtype=tl.float32)
+        acc5 = tl.zeros((BLOCK_M, 32), dtype=tl.float32)
+        acc6 = tl.zeros((BLOCK_M, 32), dtype=tl.float32)
+        acc7 = tl.zeros((BLOCK_M, 32), dtype=tl.float32)
     softmax_scale_log2: tl.constexpr = (HEAD_DIM**-0.5) * 1.4426950408889634
 
     # Dynamic bounds avoid padded main-loop iterations for uneven splits.
@@ -303,24 +381,29 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
                 mask=valid[:, None],
                 other=127,
             )
-            v_packed = tl.load(
-                base[:, None]
-                + MXFP4_BLOCK_RECORDS * HALF_D
-                + record[:, None] * HALF_D
-                + half_offsets[None, :],
-                mask=valid[:, None],
-                other=0,
-            )
-            v_scales = tl.load(
-                base[:, None]
-                + MXFP4_BLOCK_RECORDS * (HEAD_DIM + GROUPS)
-                + record[:, None] * GROUPS
-                + group_offsets[None, :],
-                mask=valid[:, None],
-                other=127,
-            )
-            values = mxfp4_dequant_rows(v_packed, v_scales, HEAD_DIM, MXFP4_HW_CVT)
-            if MXFP4_DOT_SCALED:
+            if not MXFP4_NATIVE_PV:
+                v_packed = tl.load(
+                    base[:, None]
+                    + MXFP4_BLOCK_RECORDS * HALF_D
+                    + record[:, None] * HALF_D
+                    + half_offsets[None, :],
+                    mask=valid[:, None],
+                    other=0,
+                )
+                v_scales = tl.load(
+                    base[:, None]
+                    + MXFP4_BLOCK_RECORDS * (HEAD_DIM + GROUPS)
+                    + record[:, None] * GROUPS
+                    + group_offsets[None, :],
+                    mask=valid[:, None],
+                    other=127,
+                )
+                values = mxfp4_dequant_rows(v_packed, v_scales, HEAD_DIM, MXFP4_HW_CVT)
+            if MXFP4_NATIVE_QK:
+                scores = tl.dot_scaled(
+                    q_codes, q_scales, "e4m3", tl.trans(k_packed), k_scales, "e2m1"
+                )
+            elif MXFP4_DOT_SCALED:
                 scores = tl.dot_scaled(
                     query, None, "bf16", tl.trans(k_packed), k_scales, "e2m1"
                 )
@@ -366,13 +449,109 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         probabilities = tl.where(
             valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
         )
-        accumulator = tl.dot(
-            probabilities.to(values.dtype),
-            values,
-            acc=accumulator * alpha[:, None],
-        )
+        if MXFP4_NATIVE_PV:
+            acc0 = _mxfp4_pv_group(
+                acc0,
+                probabilities,
+                alpha,
+                base,
+                record,
+                valid,
+                0,
+                MXFP4_BLOCK_RECORDS,
+                HEAD_DIM,
+            )
+            acc1 = _mxfp4_pv_group(
+                acc1,
+                probabilities,
+                alpha,
+                base,
+                record,
+                valid,
+                1,
+                MXFP4_BLOCK_RECORDS,
+                HEAD_DIM,
+            )
+            acc2 = _mxfp4_pv_group(
+                acc2,
+                probabilities,
+                alpha,
+                base,
+                record,
+                valid,
+                2,
+                MXFP4_BLOCK_RECORDS,
+                HEAD_DIM,
+            )
+            acc3 = _mxfp4_pv_group(
+                acc3,
+                probabilities,
+                alpha,
+                base,
+                record,
+                valid,
+                3,
+                MXFP4_BLOCK_RECORDS,
+                HEAD_DIM,
+            )
+            acc4 = _mxfp4_pv_group(
+                acc4,
+                probabilities,
+                alpha,
+                base,
+                record,
+                valid,
+                4,
+                MXFP4_BLOCK_RECORDS,
+                HEAD_DIM,
+            )
+            acc5 = _mxfp4_pv_group(
+                acc5,
+                probabilities,
+                alpha,
+                base,
+                record,
+                valid,
+                5,
+                MXFP4_BLOCK_RECORDS,
+                HEAD_DIM,
+            )
+            acc6 = _mxfp4_pv_group(
+                acc6,
+                probabilities,
+                alpha,
+                base,
+                record,
+                valid,
+                6,
+                MXFP4_BLOCK_RECORDS,
+                HEAD_DIM,
+            )
+            acc7 = _mxfp4_pv_group(
+                acc7,
+                probabilities,
+                alpha,
+                base,
+                record,
+                valid,
+                7,
+                MXFP4_BLOCK_RECORDS,
+                HEAD_DIM,
+            )
+        else:
+            accumulator = tl.dot(
+                probabilities.to(values.dtype),
+                values,
+                acc=accumulator * alpha[:, None],
+            )
         normalizer = normalizer * alpha + tl.sum(probabilities, axis=1)
         max_value = next_max
+
+    if MXFP4_NATIVE_PV:
+        accumulator = _cat_columns(
+            _cat_columns(_cat_columns(acc0, acc1), _cat_columns(acc2, acc3)),
+            _cat_columns(_cat_columns(acc4, acc5), _cat_columns(acc6, acc7)),
+        )
 
     has_values = normalizer > 0
     normalized_output = tl.where(
@@ -891,6 +1070,8 @@ def qsa_sparse_paged_attention(
     out: torch.Tensor | None = None,
     mxfp4_dot_scaled: bool | None = None,
     mxfp4_hw_cvt: bool | None = None,
+    mxfp4_native_qk: bool | None = None,
+    mxfp4_native_pv: bool | None = None,
 ) -> torch.Tensor:
     """Run sparse GQA directly over paged BF16, FP8, or mxfp4_qsa K/V caches.
 
@@ -913,6 +1094,12 @@ def qsa_sparse_paged_attention(
             mxfp4_dot_scaled = on_gfx950()
         if mxfp4_hw_cvt is None:
             mxfp4_hw_cvt = on_gfx950()
+        # The scaled MFMA (E4M3 x E2M1) path; see _mxfp4_pv_group.
+        native_ok = on_gfx950() and cache_head_dim == 256
+        if mxfp4_native_qk is None:
+            mxfp4_native_qk = native_ok
+        if mxfp4_native_pv is None:
+            mxfp4_native_pv = native_ok
     else:
         mxfp4_records = 0
         cache_head_dim = k_cache.shape[3]
@@ -983,6 +1170,21 @@ def qsa_sparse_paged_attention(
             block_n, target_splits, partial_warps = 64, 4, 2
         elif base_programs <= 512:
             block_n, target_splits, partial_warps = 64, 2, 2
+    # The scaled MFMA reduces 128 tokens per instruction at 16 query rows.
+    if is_mxfp4 and mxfp4_native_pv:
+        block_n = 128
+        if base_programs < 32:
+            target_splits, partial_warps = 16, 4
+        elif base_programs <= 64:
+            target_splits, partial_warps = 8, 4
+        elif base_programs <= 128:
+            target_splits, partial_warps = 4, 4
+        elif base_programs <= 256:
+            target_splits, partial_warps = 2, 4
+        else:
+            target_splits, partial_warps = 1, 4
+    if _MXFP4_PROFILE_OVERRIDE is not None and is_mxfp4:
+        block_n, target_splits, partial_warps = _MXFP4_PROFILE_OVERRIDE
     # gfx942 and gfx950 have a 64 KiB LDS limit. One software-pipelining
     # stage keeps the wide TP4 tile within that shared-memory budget.
     partial_stages = 1 if current_platform.is_rocm() else 2
@@ -1060,6 +1262,8 @@ def qsa_sparse_paged_attention(
         MXFP4_BLOCK_RECORDS=mxfp4_records,
         MXFP4_DOT_SCALED=bool(is_mxfp4 and mxfp4_dot_scaled),
         MXFP4_HW_CVT=bool(is_mxfp4 and mxfp4_hw_cvt),
+        MXFP4_NATIVE_QK=bool(is_mxfp4 and mxfp4_native_qk),
+        MXFP4_NATIVE_PV=bool(is_mxfp4 and mxfp4_native_pv),
         num_warps=partial_warps,
         num_stages=partial_stages,
     )

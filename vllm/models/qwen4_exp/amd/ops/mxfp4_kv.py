@@ -135,6 +135,24 @@ def mxfp4_quantize_groups(even, odd):
 
 
 @triton.jit
+def e4m3_quantize_rows(x):
+    """fp32 ``[rows, k]`` -> E4M3 codes with one E8M0 scale per 32 along ``k``.
+
+    The operand form of gfx950's scaled MFMA. The scale puts each group's
+    absmax in ``[128, 256)``, inside E4M3's 448 without a saturation check.
+    """
+    ROWS: tl.constexpr = x.shape[0]
+    K: tl.constexpr = x.shape[1]
+    groups = tl.reshape(x, (ROWS, K // 32, 32))
+    absmax = tl.max(tl.abs(groups), axis=2)
+    biased = (absmax.to(tl.int32, bitcast=True) >> 23) & 0xFF
+    encoded = tl.minimum(tl.maximum(biased - 7, 1), 254)
+    inv_scale = ((254 - encoded) << 23).to(tl.float32, bitcast=True)
+    codes = (groups * inv_scale[:, :, None]).to(tl.float8e4nv)
+    return tl.reshape(codes, (ROWS, K)), encoded.to(tl.uint8)
+
+
+@triton.jit
 def _e2m1_to_bf16(code, scale):
     """Decode E2M1 codes times ``2**(scale - 127)`` to BF16, exactly.
 
@@ -292,6 +310,7 @@ def store_mxfp4_qsa(
 __all__ = [
     "GROUP_SIZE",
     "block_records",
+    "e4m3_quantize_rows",
     "head_dim_from_record_bytes",
     "mxfp4_dequant_rows",
     "mxfp4_quantize_groups",

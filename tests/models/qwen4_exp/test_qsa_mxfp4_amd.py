@@ -211,6 +211,28 @@ def _reference_attention(q, keys, values, logical_indices, block_table, token_to
 )
 @pytest.mark.parametrize("dot_scaled", [False, True])
 @pytest.mark.parametrize(
+    ("native_qk", "native_pv"),
+    [
+        (False, False),
+        pytest.param(
+            False,
+            True,
+            marks=pytest.mark.skipif(
+                not current_platform.is_rocm() or not _on_gfx950(),
+                reason="the scaled MFMA is gfx950-only",
+            ),
+        ),
+        pytest.param(
+            True,
+            True,
+            marks=pytest.mark.skipif(
+                not current_platform.is_rocm() or not _on_gfx950(),
+                reason="the scaled MFMA is gfx950-only",
+            ),
+        ),
+    ],
+)
+@pytest.mark.parametrize(
     ("num_rows", "num_query_heads", "num_kv_heads", "head_major"),
     [
         pytest.param(1, 12, 1, True, id="tp2-decode"),
@@ -227,7 +249,11 @@ def test_sparse_attention_matches_dequantized_reference(
     head_major: bool,
     dot_scaled: bool,
     hw_cvt: bool,
+    native_qk: bool,
+    native_pv: bool,
 ) -> None:
+    if native_pv and not (dot_scaled and hw_cvt):
+        pytest.skip("the native path ignores dot_scaled and hw_cvt")
     torch.manual_seed(1)
     page_size, num_requests, pages_per_request = 256, 2, 12
     width = 2048 + 3
@@ -267,9 +293,19 @@ def test_sparse_attention_matches_dequantized_reference(
         token_to_req,
         mxfp4_dot_scaled=dot_scaled,
         mxfp4_hw_cvt=hw_cvt,
+        mxfp4_native_qk=native_qk,
+        mxfp4_native_pv=native_pv,
     )
     keys, values = dequantize_cache(cache)
     expected = _reference_attention(
         q, keys, values, logical_indices, block_table, token_to_req
     )
-    torch.testing.assert_close(actual.float(), expected, rtol=2e-2, atol=2e-2)
+    if not (native_qk or native_pv):
+        torch.testing.assert_close(actual.float(), expected, rtol=2e-2, atol=2e-2)
+        return
+    # The native paths round P (and Q) to E4M3 with per-32 E8M0 scales, so
+    # single elements can move by a few percent; bound the aggregate error.
+    error = actual.float() - expected
+    rel_rms = error.norm() / expected.norm()
+    assert rel_rms < 2e-2, f"{rel_rms=}"
+    assert error.abs().max() < 6e-2, f"{error.abs().max()=}"
