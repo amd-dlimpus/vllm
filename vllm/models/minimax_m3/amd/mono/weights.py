@@ -35,9 +35,11 @@ from vllm.models.minimax_m3.amd.mono.config import (
     INTER,
     LOCAL_Q_HEADS,
     N_ROUTED,
+    NVFP4_ROW,
     O_K,
     ONE_INDEX_HEAD,
     ROTARY_DIM,
+    SPARSE_BLOCK,
     TOP_K,
     TOPK_BLOCKS,
     TP,
@@ -66,7 +68,9 @@ class SparseMoeLayer:
 
     layer_id: int
     attn: object  # MiniMaxM3SparseAttention: layer name, KV cache views, scales
-    index_cache: torch.Tensor  # [blocks, block, head_dim] fp8, shared block ids
+    # [blocks, block, head_dim] fp8 or [blocks, block, NVFP4_ROW] NVFP4 bytes,
+    # sharing the KV cache's block ids
+    index_cache: torch.Tensor
     g_in: torch.Tensor
     w_qkv: torch.Tensor
     s_qkv: torch.Tensor
@@ -275,17 +279,32 @@ def build_sparse_layer(
         == (TOPK_BLOCKS, 0, 1, False),
         f"layer {layer_id}: sparse selection config",
     )
+    nvfp4 = str(attn.kv_cache_dtype) == "nvfp4"
     _need(
-        attn.use_aiter_sparse_pa and str(attn.kv_cache_dtype).startswith("fp8"),
-        f"layer {layer_id}: needs the AITER sparse PA path with an fp8 KV cache",
+        nvfp4 or (attn.use_aiter_sparse_pa and str(attn.kv_cache_dtype).startswith("fp8")),
+        f"layer {layer_id}: needs an NVFP4 KV cache or the AITER sparse PA path "
+        "with an fp8 one",
     )
     index_cache = attn.indexer.index_cache.kv_cache
+    if nvfp4:
+        kv = attn.kv_cache
+        _need(
+            kv.dtype == torch.uint8
+            and tuple(kv.shape[1:]) == (2, SPARSE_BLOCK, NVFP4_ROW)
+            and kv.is_contiguous(),
+            f"layer {layer_id}: NVFP4 KV cache {kv.dtype} {tuple(kv.shape)}",
+        )
+        index_ok = index_cache.dtype == torch.uint8 and tuple(
+            index_cache.shape[1:]
+        ) == (SPARSE_BLOCK, NVFP4_ROW)
+    else:
+        index_ok = (
+            index_cache.dtype == dtypes.fp8
+            and index_cache.dim() == 3
+            and index_cache.shape[2] == HEAD_DIM
+        )
     _need(
-        index_cache.numel() > 0
-        and index_cache.dtype == dtypes.fp8
-        and index_cache.dim() == 3
-        and index_cache.shape[2] == HEAD_DIM
-        and index_cache.is_contiguous(),
+        index_cache.numel() > 0 and index_ok and index_cache.is_contiguous(),
         f"layer {layer_id}: index cache {index_cache.dtype} {tuple(index_cache.shape)}",
     )
 

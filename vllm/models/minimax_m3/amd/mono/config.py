@@ -95,13 +95,22 @@ LAYER_SLOTS = 128  # mailbox epochs: step * LAYER_SLOTS + layer + 1
 # whether fp8 K/V carry the host's fixed unit scale instead of per-token scales
 KV_PAGE_STRIDE = SPARSE_BLOCK // PAGE16
 STATIC_KV_SCALE = False
+# NVFP4 caches instead: K/V as [block, k | v, SPARSE_BLOCK keys, NVFP4_ROW bytes]
+# and index-K as [block, SPARSE_BLOCK keys, NVFP4_ROW bytes], a row being 64 bytes
+# of e2m1 codes then one E4M3 scale per 16 dims, under the layer's fp32 global
+# K / V scales (the stock NVFP4 insert's layout; no page-16 views)
+KV_NVFP4 = False
+NVFP4_ROW = HEAD_DIM // 2 + HEAD_DIM // 16
 
 
-def configure(*, kv_page_stride: int, static_kv_scale: bool) -> None:
-    global KV_PAGE_STRIDE, STATIC_KV_SCALE
+def configure(
+    *, kv_page_stride: int, static_kv_scale: bool, kv_nvfp4: bool = False
+) -> None:
+    global KV_PAGE_STRIDE, STATIC_KV_SCALE, KV_NVFP4
     assert kv_page_stride in (SPARSE_BLOCK // PAGE16, 2 * SPARSE_BLOCK // PAGE16)
     KV_PAGE_STRIDE = kv_page_stride
     STATIC_KV_SCALE = static_kv_scale
+    KV_NVFP4 = kv_nvfp4
 
 
 class MonoUnsupported(Exception):

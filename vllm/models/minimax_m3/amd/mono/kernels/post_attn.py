@@ -76,6 +76,7 @@ from vllm.models.minimax_m3.amd.mono.config import (
     TP,
     WAVES,
     IndexHeads,
+    MonoUnsupported,
 )
 from vllm.models.minimax_m3.amd.mono.kernels.common import (
     CM_DEV,
@@ -230,6 +231,8 @@ def build_post_attn_kernel(
     the ``sh_args`` pointer table (``SH_ARGS``; 0 otherwise), its GEMVs fp8 x fp8
     MFMAs."""
     assert 1 <= tokens <= MAX_TOKENS
+    if mono_config.KV_NVFP4:
+        raise MonoUnsupported("NVFP4 KV: the K1 insert and K4 cache reads")
     N_E = N_ROUTED if shared_fp8 else N_ROUTED + 1  # experts in w13 .. s2
     E_TOP = N_E - 1  # the bound a routed expert id is clamped to
     S13_BYTES = N_E * W13_ROWS * W13_SCALE_COLS  # e8m0, every expert

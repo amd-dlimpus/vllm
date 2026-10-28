@@ -31,6 +31,7 @@ from vllm.models.minimax_m3.amd.mono.config import (
     MAX_TOKENS,
     N_ROUTED,
     PAGE16,
+    SPARSE_BLOCK,
     TOP_K,
     TOPK_BLOCKS,
     TP,
@@ -140,9 +141,22 @@ class MonoDecodeRunner:
         self._cache_ptrs = self.cache_ptrs(model, n_dense)
         # the K/V page views (V offset to its side of the block) and how many page
         # ids a block spans; the kernels are compiled for that geometry
-        self.kv_views = [lyr.self_attn.get_aiter_sparse_pa_kv_cache() for lyr in layers]
-        stride = attn0._aiter_sparse_pa_block_page_stride
-        mono_config.configure(kv_page_stride=stride, static_kv_scale=True)
+        self.kv_nvfp4 = str(attn0.kv_cache_dtype) == "nvfp4"
+        if self.kv_nvfp4:
+            # the K and V sides of every block, under the layer's global scales
+            self.kv_views = {
+                lw.layer_id: (lw.attn.kv_cache[:, 0], lw.attn.kv_cache[:, 1])
+                for lw in self.sparse
+            }
+            stride = SPARSE_BLOCK // PAGE16
+        else:
+            self.kv_views = [
+                lyr.self_attn.get_aiter_sparse_pa_kv_cache() for lyr in layers
+            ]
+            stride = attn0._aiter_sparse_pa_block_page_stride
+        mono_config.configure(
+            kv_page_stride=stride, static_kv_scale=True, kv_nvfp4=self.kv_nvfp4
+        )
         self._build(
             npes, heads, float(config.rms_norm_eps), float(moe0.routed_scaling_factor),
             shared_weight,
@@ -150,9 +164,15 @@ class MonoDecodeRunner:
             sel.init_blocks, sel.local_blocks,
         )  # fmt: skip
         dev = self.h.device
-        n16 = self.kv_views[0][0].shape[0]
-        # the host's unit fp8 scale for every page-16 slot (K1 writes 1.0 back)
-        self.kv_scale = torch.ones(n16, 1, PAGE16, dtype=torch.float32, device=dev)
+        if self.kv_nvfp4:
+            self.kv_scales = {
+                lw.layer_id: (lw.attn._k_scale, lw.attn._v_scale) for lw in self.sparse
+            }
+        else:
+            n16 = self.kv_views[0][0].shape[0]
+            # the host's unit fp8 scale for every page-16 slot (K1 writes 1.0 back)
+            kv_scale = torch.ones(n16, 1, PAGE16, dtype=torch.float32, device=dev)
+            self.kv_scales = [(kv_scale, kv_scale)] * len(layers)
         self.res0 = torch.zeros(MAX_TOKENS, HIDDEN, dtype=torch.bfloat16, device=dev)
 
     @staticmethod
@@ -240,9 +260,10 @@ class MonoDecodeRunner:
         n = res.shape[0]
         block_table, seq_lens, slots, q_len = tables
         k16, v16 = self.kv_views[lw.layer_id]
+        k_scale, v_scale = self.kv_scales[lw.layer_id]
         self.k4[n](
             _ptr(self.h), _ptr(self.q), _ptr(block_table), _ptr(seq_lens),
-            _ptr(k16), _ptr(v16), _ptr(self.kv_scale), _ptr(self.kv_scale),
+            _ptr(k16), _ptr(v16), _ptr(k_scale), _ptr(v_scale),
             _ptr(lw.w_o), _ptr(lw.s_o), _ptr(lw.g_post),
             _ptr(lw.gate), _ptr(lw.bias), _ptr(lw.w13), _ptr(lw.s13),
             _ptr(lw.w2), _ptr(lw.s2),

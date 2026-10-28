@@ -89,14 +89,23 @@ def test_dense_prefix_refuses_other_layer_mixes(layers):
 
 
 def test_configure_accepts_only_the_two_kv_page_strides():
-    saved = (mono_config.KV_PAGE_STRIDE, mono_config.STATIC_KV_SCALE)
+    saved = (
+        mono_config.KV_PAGE_STRIDE,
+        mono_config.STATIC_KV_SCALE,
+        mono_config.KV_NVFP4,
+    )
     try:
         mono_config.configure(kv_page_stride=16, static_kv_scale=True)
         assert (mono_config.KV_PAGE_STRIDE, mono_config.STATIC_KV_SCALE) == (16, True)
+        assert not mono_config.KV_NVFP4
+        mono_config.configure(kv_page_stride=8, static_kv_scale=True, kv_nvfp4=True)
+        assert mono_config.KV_NVFP4 and mono_config.NVFP4_ROW == 72
         with pytest.raises(AssertionError):
             mono_config.configure(kv_page_stride=4, static_kv_scale=True)
     finally:
-        mono_config.configure(kv_page_stride=saved[0], static_kv_scale=saved[1])
+        mono_config.configure(
+            kv_page_stride=saved[0], static_kv_scale=saved[1], kv_nvfp4=saved[2]
+        )
 
 
 def _vllm_config(**overrides):
@@ -140,6 +149,32 @@ def _model(fse: bool = True, shared_mlp: bool = True, aux=()):
 @pytest.mark.parametrize("aux", [(), (2, 30, 57)])
 def test_config_refusal_accepts_the_supported_deployment(fse, aux):
     assert _config_refusal(_vllm_config(), _model(fse=fse, aux=aux)) is None
+
+
+def _nvfp4_config(index_dtype="nvfp4"):
+    return _vllm_config(
+        **{
+            "cache_config.cache_dtype": "nvfp4",
+            "attention_config.resolve_indexer_kv_dtype": lambda default: index_dtype,
+        }
+    )
+
+
+def test_config_refusal_accepts_nvfp4_kv_and_index_caches():
+    assert _config_refusal(_nvfp4_config(), _model()) is None
+
+
+@pytest.mark.parametrize(
+    "cfg",
+    [
+        _nvfp4_config(index_dtype="fp8"),
+        _vllm_config(
+            **{"attention_config.resolve_indexer_kv_dtype": lambda default: "nvfp4"}
+        ),
+    ],
+)
+def test_config_refusal_rejects_mixed_cache_formats(cfg):
+    assert "kv cache" in _config_refusal(cfg, _model())
 
 
 @pytest.mark.parametrize(
