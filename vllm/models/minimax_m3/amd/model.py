@@ -17,6 +17,7 @@ The MiniMax-M3-preview config selects a single set of branches:
       "index" attention branch.
 """
 
+import os
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
@@ -156,6 +157,40 @@ logger = init_logger(__name__)
 
 # The fused QK-norm/RoPE/KV-insert HIP op segfaults on gfx942.
 _USE_GFX942_NATIVE_QKNORM_ROPE = on_gfx942()
+
+# Accuracy experiment: round K, V and index-K to OCP MXFP4 values (E2M1, one
+# E8M0 scale per 32 dims) before the FP8/BF16 cache insert. E2M1 x 2**e has at
+# most two significant bits, so e4m3 and bf16 hold it exactly and the cache
+# then serves MXFP4 values through the existing kernels.
+_EMULATE_MXFP4_KV = os.environ.get("VLLM_ROCM_MINIMAX_M3_EMULATE_MXFP4_KV") == "1"
+
+
+def _round_to_mxfp4_(x: torch.Tensor) -> None:
+    """In place. Same rounding as vllm/v1/attention/ops/mxfp4_e2m1.py: scale
+    ceil_pow2(amax / 6) clamped to E8M0 [2**-126, 2**127] (2**0 for an all-zero
+    group), elements round to nearest with ties to the even code."""
+    g = x.float().unflatten(-1, (-1, 32))
+    amax = g.abs().amax(-1, keepdim=True)
+    bits = (amax / 6.0).view(torch.int32)
+    exp = ((bits >> 23) & 0xFF) - 127 + ((bits & 0x7FFFFF) != 0).to(torch.int32)
+    exp = torch.where(amax == 0, 0, exp.clamp(-126, 127))
+    scale = torch.exp2(exp.float())
+    n = g / scale
+    a = n.abs()
+    idx = (
+        (a > 0.25).int()
+        + (a >= 0.75).int()
+        + (a > 1.25).int()
+        + (a >= 1.75).int()
+        + (a > 2.5).int()
+        + (a >= 3.5).int()
+        + (a > 5.0).int()
+    )
+    # codes 0..3 are 0, 0.5, 1, 1.5; codes 4..7 are 2, 3, 4, 6
+    mag = torch.where(
+        idx < 4, idx * 0.5, (2 + (idx & 1)) * torch.exp2(((idx - 4) >> 1).float())
+    )
+    x.copy_((torch.copysign(mag, n) * scale).flatten(-2))
 
 
 def _sparse_attention_layer_ids(config: PreTrainedConfig) -> set[int]:
@@ -820,6 +855,13 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                 self.num_kv_heads, emits_sparse_block_table=self.indexer_emits_table
             )
         )
+        if _EMULATE_MXFP4_KV and (
+            not self.use_aiter_sparse_pa or _USE_GFX942_NATIVE_QKNORM_ROPE
+        ):
+            raise ValueError(
+                "VLLM_ROCM_MINIMAX_M3_EMULATE_MXFP4_KV needs the AITER sparse-PA "
+                "path (FP8 or BF16 KV, VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT=1, gfx950)"
+            )
         self.kv_cache_k = torch.tensor([])
         self.kv_cache_v = torch.tensor([])
         self._aiter_sparse_pa_cache_data_ptr = 0
@@ -991,6 +1033,14 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
     ) -> None:
         if self.kv_cache.numel() == 0:
             return
+        if _EMULATE_MXFP4_KV:
+            for scale in ("_k_scale_float", "_v_scale_float"):
+                if getattr(self, scale, 1.0) != 1.0:
+                    raise ValueError(f"MXFP4 KV emulation needs a unit {scale}")
+            _round_to_mxfp4_(k)
+            _round_to_mxfp4_(v)
+            if index_k is not None:
+                _round_to_mxfp4_(index_k)
         from aiter import reshape_and_cache
 
         from vllm.models.minimax_m3.amd.ops.sparse_pa import (
@@ -1195,8 +1245,11 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             )
             k_scale = getattr(self, "_k_scale", None)
             v_scale = getattr(self, "_v_scale", None)
-            use_fused_qknorm = rocm_aiter_ops.fused_qknorm_idxrqknorm_enabled(
-                self.kv_cache_dtype, k_scale, v_scale
+            use_fused_qknorm = (
+                not _EMULATE_MXFP4_KV
+                and rocm_aiter_ops.fused_qknorm_idxrqknorm_enabled(
+                    self.kv_cache_dtype, k_scale, v_scale
+                )
             )
         if self.skip_index_topk:
             index_q = None
@@ -1704,6 +1757,9 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         # VLLM_ROCM_MINIMAX_M3_MONO=1: supported decode steps run one FlyDSL
         # launch per layer (mono kernels)
         self._mono = None
+        if mono_envs.MONO_ENABLE and _EMULATE_MXFP4_KV:
+            raise ValueError("MXFP4 KV emulation runs on the stock path; set "
+                             "VLLM_ROCM_MINIMAX_M3_MONO=0")
         if mono_envs.MONO_ENABLE:
             from vllm.models.minimax_m3.amd.mono.dispatch import MonoDecode
 
