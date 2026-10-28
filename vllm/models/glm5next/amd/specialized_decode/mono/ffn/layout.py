@@ -188,6 +188,7 @@ def layout(
             ("kv_ready", samples * pair_bytes),
             ("iscores", samples * max(max_pools, 1) * pair_bytes),
             ("tok_sel", samples * TOPK_TOKENS * 4),
+            ("slot_sel", samples * TOPK_TOKENS * 4),
             ("tok_ready", samples * pair_bytes),
             ("sp_acc", samples * N_SPLIT * H * KV_LORA // 2 * pair_bytes),
             ("sp_m", samples * N_SPLIT * H * pair_bytes),
