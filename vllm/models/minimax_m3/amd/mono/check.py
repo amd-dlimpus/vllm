@@ -7,13 +7,15 @@
 the mono layer kernel, then the original decoder layer. Both insert the same cache
 slots (the kernel writes the same bytes up to the re-quantized attention weights),
 so running both is side-effect free. Rank 0 logs, per layer and token, the
-difference of the residual stream and of the reduced MoE output.
+difference of the residual stream and of the reduced MoE output, and with NVFP4
+caches the share of the step's cache bytes (K / V, index-K) the two inserts wrote
+differently: a few from rounding, nearly all from a layout error.
 """
 
 import torch
 
 from vllm.logger import init_logger
-from vllm.models.minimax_m3.amd.mono.config import HIDDEN
+from vllm.models.minimax_m3.amd.mono.config import HIDDEN, NVFP4_ROW, SPARSE_BLOCK
 
 logger = init_logger(__name__)
 
@@ -23,6 +25,19 @@ def _diff(a: torch.Tensor, b: torch.Tensor) -> str:
     d = (a - b).abs()
     rel = (d.norm() / b.norm().clamp(min=1e-30)).item()
     return f"max {d.max().item():.3e} rel {rel:.3e}"
+
+
+def _cache_blocks(caches, blocks) -> list[torch.Tensor]:
+    return [c[blocks].clone() for c in caches]
+
+
+def _bytes_differing(before: list[torch.Tensor], caches, blocks, n: int) -> str:
+    """Bytes of ``caches``' ``blocks`` unlike ``before``, per n tokens' rows."""
+    out = []
+    for b, c, rows in zip(before, caches, (2, 1)):
+        diff = int((b != c[blocks]).sum())
+        out.append(f"{diff / (n * rows * NVFP4_ROW):.2%}")
+    return " / ".join(out)
 
 
 def forward_checked(
@@ -45,7 +60,18 @@ def forward_checked(
         h_in = ars[i % 2][:n].clone()
         res_in = res.clone()
         res = runner.run_sparse_layer(i, lw, tables, positions, res)
+        if runner.kv_nvfp4:
+            caches = (lw.attn.kv_cache, lw.index_cache)
+            slots = tables.slot_mapping[:n]
+            blocks = torch.unique(slots[slots >= 0] // SPARSE_BLOCK)
+            mono_bytes = _cache_blocks(caches, blocks)
         ref_h, ref_res = layer(positions, h_in, res_in)
+        if runner.kv_nvfp4 and runner.rank == 0:
+            logger.info(
+                "mono check layer %d: cache bytes unlike the stock insert's "
+                "(K/V / index-K) %s",
+                lw.layer_id, _bytes_differing(mono_bytes, caches, blocks, n),
+            )  # fmt: skip
         if aux_hidden_states is not None:
             runner.model._maybe_add_hidden_state(
                 aux_hidden_states,
