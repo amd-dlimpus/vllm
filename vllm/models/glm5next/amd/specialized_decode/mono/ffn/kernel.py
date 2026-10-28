@@ -318,7 +318,20 @@ def build_flash_ffn_kernel(
     RED_OFF = DNW_OFF + S * MOE_SLOTS
     OUT_OFF = RED_OFF + RED_WORDS
     OUT_WORDS = max(S * ROW_TILE, S * 2 * UG_TILE, S * DN_TILE)
-    WORK_WORDS = OUT_OFF + OUT_WORDS
+    # pool select: the histogram pass's keys, so the candidate pass of a row of at
+    # most SELK_CHUNKS chunks reads LDS instead of the score mailbox again
+    SELK_OFF = (OUT_OFF + OUT_WORDS + 3) // 4 * 4
+    SELK_CHUNKS = (
+        max(
+            0,
+            min(-(-max(max_pools, 1) // SEL_CHUNK), (32768 - SELK_OFF) // SEL_CHUNK),
+        )
+        if dsa
+        else 0
+    )
+    WORK_WORDS = (
+        SELK_OFF + SELK_CHUNKS * SEL_CHUNK if SELK_CHUNKS else OUT_OFF + OUT_WORDS
+    )
     assert WORK_WORDS <= 32768, "keep static LDS below the MI355X per-workgroup budget"
 
     order = stage_tasks(S, expert_inter, W, kda, dsa)
@@ -2258,6 +2271,34 @@ def build_flash_ffn_kernel(
                             ]
                         return out
 
+                    cached = n_chunks <= SELK_CHUNKS
+
+                    def keep_keys(chunk, item_keys):
+                        w = chunk * SEL_CHUNK + tid * SEL_ITEMS
+                        for h in range_constexpr(SEL_ITEMS // 4):
+                            fx.ptr_store(
+                                fx.Vector.from_elements(
+                                    [
+                                        k.bitcast(fx.Float32)
+                                        for k in item_keys[4 * h : 4 * h + 4]
+                                    ],
+                                    fx.Float32,
+                                ),
+                                xs + (SELK_OFF + w + 4 * h),
+                            )
+
+                    def kept_keys(chunk):
+                        w = chunk * SEL_CHUNK + tid * SEL_ITEMS
+                        out = []
+                        for h in range_constexpr(SEL_ITEMS // 4):
+                            v = fx.Vector(
+                                fx.ptr_load(
+                                    xs + (SELK_OFF + w + 4 * h), result_type=v4f
+                                )
+                            ).bitcast(fx.Int32)
+                            out += [fx.Uint32(v[e]) for e in range(4)]
+                        return out
+
                     def clear_hist():
                         for b in range_constexpr(SEL_BINS // THREADS):
                             lds_st(hist, tid + b * THREADS, fx.Int32(0))
@@ -2391,10 +2432,9 @@ def build_flash_ffn_kernel(
                     def candidates(level, prefix, remain, n_cand):
                         """Keys above the ``level`` bin go to red, the bin's to LDS."""
                         set_bases(fx.Int32(0), fx.Int32(0))
-                        for chunk in range(fx.Int32(0), n_chunks, fx.Int32(1)):
-                            chunk = fx.Int32(chunk)
+
+                        def scan(chunk, item_keys):
                             items = chunk_items(chunk)
-                            item_keys = load_keys(items)
                             high = [
                                 (i < bound) & ((k >> level) > (prefix >> level))
                                 for i, k in zip(items, item_keys)
@@ -2415,6 +2455,16 @@ def build_flash_ffn_kernel(
                                 if same[j]:
                                     lds_st(xs, c, item_keys[j].bitcast(fx.Float32))
                                     lds_st(xs, c + 1, items[j].bitcast(fx.Float32))
+
+                        if const_expr(SELK_CHUNKS > 0):
+                            if cached:
+                                for chunk in range(fx.Int32(0), n_chunks, fx.Int32(1)):
+                                    chunk = fx.Int32(chunk)
+                                    scan(chunk, kept_keys(chunk))
+                        if n_chunks > SELK_CHUNKS:
+                            for chunk in range(fx.Int32(0), n_chunks, fx.Int32(1)):
+                                chunk = fx.Int32(chunk)
+                                scan(chunk, load_keys(chunk_items(chunk)))
                         gpu.barrier()
                         n_win = count - remain
 
@@ -2521,6 +2571,9 @@ def build_flash_ffn_kernel(
                     for chunk in range(fx.Int32(0), n_chunks, fx.Int32(1)):
                         items = chunk_items(fx.Int32(chunk))
                         item_keys = poll_keys(items)
+                        if const_expr(SELK_CHUNKS > 0):
+                            if cached:
+                                keep_keys(fx.Int32(chunk), item_keys)
                         for j in range_constexpr(SEL_ITEMS):
                             if items[j] < bound:
                                 fx.atomic_add(
