@@ -95,10 +95,10 @@ LAYER_SLOTS = 128  # mailbox epochs: step * LAYER_SLOTS + layer + 1
 # whether fp8 K/V carry the host's fixed unit scale instead of per-token scales
 KV_PAGE_STRIDE = SPARSE_BLOCK // PAGE16
 STATIC_KV_SCALE = False
-# NVFP4 caches instead: K/V as [block, k | v, SPARSE_BLOCK keys, NVFP4_ROW bytes]
-# and index-K as [block, SPARSE_BLOCK keys, NVFP4_ROW bytes], a row being 64 bytes
-# of e2m1 codes then one E4M3 scale per 16 dims, under the layer's fp32 global
-# K / V scales (the stock NVFP4 insert's layout; no page-16 views)
+# NVFP4 caches instead, in the stock NVFP4 insert's layout under the layer's fp32
+# global K / V scales (no page-16 views). [.., SPARSE_BLOCK, NVFP4_ROW] is only the
+# byte size of a block side: its e2m1 codes come first, then one E4M3 scale per 16
+# dims, and K's scales are swizzled and V's codes octet-transposed (pre_attn.py)
 KV_NVFP4 = False
 NVFP4_ROW = HEAD_DIM // 2 + HEAD_DIM // 16
 
