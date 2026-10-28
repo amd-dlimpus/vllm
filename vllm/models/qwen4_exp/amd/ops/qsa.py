@@ -260,6 +260,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     partial_output_ptr,
     partial_lse_ptr,
     output_ptr,
+    vfold_scratch_ptr,
     stride_q_row,
     stride_q_head,
     stride_k_block,
@@ -293,6 +294,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     MXFP4_NATIVE_QK: tl.constexpr = False,
     MXFP4_NATIVE_PV: tl.constexpr = False,
     MXFP4_PV_CEILING: tl.constexpr = False,
+    MXFP4_PV_VFOLD: tl.constexpr = False,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -382,7 +384,16 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
                 mask=valid[:, None],
                 other=127,
             )
-            if not (MXFP4_NATIVE_PV or MXFP4_PV_CEILING):
+            if MXFP4_PV_VFOLD:
+                v_packed = tl.load(
+                    base[:, None]
+                    + MXFP4_BLOCK_RECORDS * HALF_D
+                    + record[:, None] * HALF_D
+                    + half_offsets[None, :],
+                    mask=valid[:, None],
+                    other=0,
+                )
+            elif not (MXFP4_NATIVE_PV or MXFP4_PV_CEILING):
                 v_packed = tl.load(
                     base[:, None]
                     + MXFP4_BLOCK_RECORDS * HALF_D
@@ -450,7 +461,62 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         probabilities = tl.where(
             valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
         )
-        if MXFP4_PV_CEILING:
+        if MXFP4_PV_VFOLD:
+            # V-fold: shift each V element by its token's E8M0 scale relative to
+            # the 32-token block max of its 32-column group. The shift is a power
+            # of two, so the E4M3 conversion is exact for shifts >= -8 (smaller
+            # ones underflow, below the block max by 2^8). The block max becomes
+            # the rhs scale, which runs along tokens as the scaled MFMA expects,
+            # so P is quantized once per tile instead of once per column group.
+            NB: tl.constexpr = BLOCK_N // 32
+            v_scales = tl.load(
+                base[:, None]
+                + MXFP4_BLOCK_RECORDS * (HEAD_DIM + GROUPS)
+                + record[:, None] * GROUPS
+                + group_offsets[None, :],
+                mask=valid[:, None],
+                other=0,
+            ).to(tl.int32)
+            v_blocks = tl.reshape(v_scales, (NB, 32, GROUPS))
+            shift = v_blocks - tl.max(v_blocks, axis=1)[:, None, :]
+            shifted = tl.reshape(tl.maximum(shift + 127, 1), (BLOCK_N, GROUPS))
+            v_e4m3 = mxfp4_dequant_rows(
+                v_packed, shifted, HEAD_DIM, MXFP4_HW_CVT
+            ).to(tl.float8e4nv)
+            # The same block max per head_dim column, built from a load: a
+            # broadcast scale tile fails TritonAMDGPUAccelerateMatmul.
+            s_full = tl.load(
+                base[:, None]
+                + MXFP4_BLOCK_RECORDS * (HEAD_DIM + GROUPS)
+                + record[:, None] * GROUPS
+                + (dim_offsets // 32)[None, :],
+                mask=valid[:, None],
+                other=0,
+            )
+            block_max = tl.max(tl.reshape(s_full, (NB, 32, HEAD_DIM)), axis=1)
+            # Triton 3.8's AMD matmul lowering accepts only a loaded rhs scale
+            # tile, so the computed one goes through per-program scratch.
+            scratch = (
+                vfold_scratch_ptr
+                + ((row * tl.num_programs(1) + kv_head) * NUM_SPLITS + split_id)
+                * (HEAD_DIM * NB)
+                + dim_offsets[:, None] * NB
+                + tl.arange(0, NB)[None, :]
+            )
+            tl.store(scratch, tl.trans(block_max).to(tl.uint8))
+            tl.debug_barrier()
+            v_scales_rhs = tl.load(scratch)
+            p_codes, p_scales = e4m3_quantize_rows(probabilities)
+            accumulator = tl.dot_scaled(
+                p_codes,
+                p_scales,
+                "e4m3",
+                v_e4m3,
+                v_scales_rhs,
+                "e4m3",
+                acc=accumulator * alpha[:, None],
+            )
+        elif MXFP4_PV_CEILING:
             # Speed ceiling of a one-quantization-per-tile layout: a per-token V
             # scale folded into P once, and per-channel rhs scales fed natively.
             # Bytes match the real cache; numerics are not meaningful.
@@ -1131,6 +1197,7 @@ def qsa_sparse_paged_attention(
     mxfp4_native_qk: bool | None = None,
     mxfp4_native_pv: bool | None = None,
     mxfp4_pv_ceiling: bool = False,
+    mxfp4_pv_vfold: bool = False,
 ) -> torch.Tensor:
     """Run sparse GQA directly over paged BF16, FP8, or mxfp4_qsa K/V caches.
 
@@ -1230,7 +1297,7 @@ def qsa_sparse_paged_attention(
         elif base_programs <= 512:
             block_n, target_splits, partial_warps = 64, 2, 2
     # The scaled MFMA reduces 128 tokens per instruction at 16 query rows.
-    if is_mxfp4 and (mxfp4_native_pv or mxfp4_pv_ceiling):
+    if is_mxfp4 and (mxfp4_native_pv or mxfp4_pv_ceiling or mxfp4_pv_vfold):
         block_n = 128
         if base_programs < 32:
             target_splits, partial_warps = 16, 4
@@ -1286,6 +1353,15 @@ def qsa_sparse_paged_attention(
         )
 
     partial_grid = (q.shape[0], k_cache.shape[2], num_splits)
+    vfold_scratch = (
+        torch.empty(
+            q.shape[0] * k_cache.shape[2] * num_splits * q.shape[2] * (block_n // 32),
+            dtype=torch.uint8,
+            device=q.device,
+        )
+        if is_mxfp4 and mxfp4_pv_vfold
+        else out
+    )
     _qsa_sparse_paged_gqa_splitk_kernel[partial_grid](
         q,
         k_cache,
@@ -1296,6 +1372,7 @@ def qsa_sparse_paged_attention(
         partial_output,
         partial_lse,
         out,
+        vfold_scratch,
         q.stride(0),
         q.stride(1),
         *cache_strides,
@@ -1322,8 +1399,11 @@ def qsa_sparse_paged_attention(
         MXFP4_DOT_SCALED=bool(is_mxfp4 and mxfp4_dot_scaled),
         MXFP4_HW_CVT=bool(is_mxfp4 and mxfp4_hw_cvt),
         MXFP4_NATIVE_QK=bool(is_mxfp4 and mxfp4_native_qk),
-        MXFP4_NATIVE_PV=bool(is_mxfp4 and mxfp4_native_pv and not mxfp4_pv_ceiling),
-        MXFP4_PV_CEILING=bool(is_mxfp4 and mxfp4_pv_ceiling),
+        MXFP4_NATIVE_PV=bool(
+            is_mxfp4 and mxfp4_native_pv and not (mxfp4_pv_ceiling or mxfp4_pv_vfold)
+        ),
+        MXFP4_PV_CEILING=bool(is_mxfp4 and mxfp4_pv_ceiling and not mxfp4_pv_vfold),
+        MXFP4_PV_VFOLD=bool(is_mxfp4 and mxfp4_pv_vfold),
         num_warps=partial_warps,
         num_stages=partial_stages,
     )
