@@ -292,6 +292,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     MXFP4_HW_CVT: tl.constexpr = False,
     MXFP4_NATIVE_QK: tl.constexpr = False,
     MXFP4_NATIVE_PV: tl.constexpr = False,
+    MXFP4_PV_CEILING: tl.constexpr = False,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -381,7 +382,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
                 mask=valid[:, None],
                 other=127,
             )
-            if not MXFP4_NATIVE_PV:
+            if not (MXFP4_NATIVE_PV or MXFP4_PV_CEILING):
                 v_packed = tl.load(
                     base[:, None]
                     + MXFP4_BLOCK_RECORDS * HALF_D
@@ -449,7 +450,64 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         probabilities = tl.where(
             valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
         )
-        if MXFP4_NATIVE_PV:
+        if MXFP4_PV_CEILING:
+            # Speed ceiling of a one-quantization-per-tile layout: a per-token V
+            # scale folded into P once, and per-channel rhs scales fed natively.
+            # Bytes match the real cache; numerics are not meaningful.
+            tok_scale = tl.load(
+                base + MXFP4_BLOCK_RECORDS * (HEAD_DIM + GROUPS) + record * GROUPS,
+                mask=valid,
+                other=127,
+            )
+            fold = (tok_scale.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+            p_codes, p_scales = e4m3_quantize_rows(probabilities * fold[None, :])
+            # V packed along tokens (a V-transposed page sub-block): the even
+            # token of each pair addresses the pair's 256 bytes, which in the
+            # current layout are the two consecutive records' V rows.
+            pair_columns = tile * BLOCK_N + 2 * tl.arange(0, BLOCK_N // 2)
+            pair_token = tl.load(
+                indices_ptr + row * stride_indices_row + pair_columns,
+                mask=pair_columns < TOPK,
+                other=-1,
+            )
+            pair_valid = pair_token >= 0
+            pair_token = tl.maximum(pair_token, 0)
+            pair_page = tl.load(
+                block_table_ptr
+                + safe_request * stride_table_req
+                + tl.minimum(pair_token // PAGE_SIZE, PAGE_TABLE_WIDTH - 1),
+                mask=pair_valid,
+                other=0,
+            )
+            pair_base = (
+                k_cache_ptr + tl.maximum(pair_page, 0).to(tl.int64) * stride_k_block
+            )
+            pair_record = (pair_token % PAGE_SIZE) * stride_k_token + kv_head * stride_k_head
+            v_codes = tl.load(
+                pair_base[:, None]
+                + MXFP4_BLOCK_RECORDS * HALF_D
+                + pair_record[:, None] * HALF_D
+                + dim_offsets[None, :],
+                mask=pair_valid[:, None],
+                other=0,
+            )
+            # A broadcast scale tile fails TritonAMDGPUAccelerateMatmul; load it.
+            v_scales = tl.load(
+                k_cache_ptr
+                + MXFP4_BLOCK_RECORDS * HEAD_DIM
+                + dim_offsets[:, None] * (BLOCK_N // 32)
+                + tl.arange(0, BLOCK_N // 32)[None, :]
+            )
+            accumulator = tl.dot_scaled(
+                p_codes,
+                p_scales,
+                "e4m3",
+                v_codes,
+                v_scales,
+                "e2m1",
+                acc=accumulator * alpha[:, None],
+            )
+        elif MXFP4_NATIVE_PV:
             acc0 = _mxfp4_pv_group(
                 acc0,
                 probabilities,
@@ -1072,6 +1130,7 @@ def qsa_sparse_paged_attention(
     mxfp4_hw_cvt: bool | None = None,
     mxfp4_native_qk: bool | None = None,
     mxfp4_native_pv: bool | None = None,
+    mxfp4_pv_ceiling: bool = False,
 ) -> torch.Tensor:
     """Run sparse GQA directly over paged BF16, FP8, or mxfp4_qsa K/V caches.
 
@@ -1171,7 +1230,7 @@ def qsa_sparse_paged_attention(
         elif base_programs <= 512:
             block_n, target_splits, partial_warps = 64, 2, 2
     # The scaled MFMA reduces 128 tokens per instruction at 16 query rows.
-    if is_mxfp4 and mxfp4_native_pv:
+    if is_mxfp4 and (mxfp4_native_pv or mxfp4_pv_ceiling):
         block_n = 128
         if base_programs < 32:
             target_splits, partial_warps = 16, 4
@@ -1263,7 +1322,8 @@ def qsa_sparse_paged_attention(
         MXFP4_DOT_SCALED=bool(is_mxfp4 and mxfp4_dot_scaled),
         MXFP4_HW_CVT=bool(is_mxfp4 and mxfp4_hw_cvt),
         MXFP4_NATIVE_QK=bool(is_mxfp4 and mxfp4_native_qk),
-        MXFP4_NATIVE_PV=bool(is_mxfp4 and mxfp4_native_pv),
+        MXFP4_NATIVE_PV=bool(is_mxfp4 and mxfp4_native_pv and not mxfp4_pv_ceiling),
+        MXFP4_PV_CEILING=bool(is_mxfp4 and mxfp4_pv_ceiling),
         num_warps=partial_warps,
         num_stages=partial_stages,
     )
