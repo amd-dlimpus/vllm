@@ -285,8 +285,6 @@ def build_flash_ffn_kernel(
         SEL_BINS + 2 * 2048 if dsa else 0,
     )
     SEL_CAP = (X_WORDS - SEL_BINS) // 2
-    # blocks of a row whose block table the select keeps in red, past the pools
-    BT_CAP = RED_WORDS - TOPK_POOLS
     # fp8 KV write: a row's 512 normed values, past the kpool compress's words
     KVX = 2 * INDEX_DIM
     assert not kv_fp8 or (dsa and KVX + KV_LORA <= X_WORDS)
@@ -2179,9 +2177,6 @@ def build_flash_ffn_kernel(
             hist = fx.recast_iter(fx.Int32, xs)
             r_scores = _rsrc(mb("iscores"))
             r_sel = _rsrc(mb("tok_sel"))
-            r_slot = _rsrc(mb("slot_sel"))
-            r_bt = _rsrc(tv["block_table"])
-            KVB = t32["kv_block_tokens"]
 
             def radix_key(bits):
                 return (bits >= 0).select(bits ^ fx.Int32(-(2**31)), ~bits)
@@ -2218,19 +2213,6 @@ def build_flash_ffn_kernel(
                     bound = (pos + 1) // KPOOL
                     count = fx.Int32(TOPK_POOLS)
                     n_chunks = (bound + SEL_CHUNK - 1) // SEL_CHUNK
-                    # the row's block table, past the pools in red, read while the
-                    # scores are still coming: the published slots need no lookup
-                    bt_row = row_word(s, ROW_BT) * t32["bt_stride"]
-                    n_blk = pos // KVB + 1
-                    if n_blk <= BT_CAP:
-                        for b in range_constexpr(-(-BT_CAP // THREADS)):
-                            i = tid + b * THREADS
-                            if i < n_blk:
-                                lds_st(
-                                    red,
-                                    TOPK_POOLS + i,
-                                    ld_i32(r_bt, bt_row + i).bitcast(fx.Float32),
-                                )
 
                     def chunk_items(chunk):
                         return [
@@ -2423,23 +2405,6 @@ def build_flash_ffn_kernel(
                                 s * TOPK_TOKENS + j,
                                 cache_modifier=CM_DEV,
                             )
-                            if n_blk <= BT_CAP:
-                                blk = lds_ld(red, TOPK_POOLS + tok // KVB).bitcast(
-                                    fx.Int32
-                                )
-                                bo.buffer_store(
-                                    blk * KVB + tok % KVB,
-                                    r_slot,
-                                    s * TOPK_TOKENS + j,
-                                    cache_modifier=CM_DEV,
-                                )
-                            if n_blk > BT_CAP:
-                                bo.buffer_store(
-                                    ld_i32(r_bt, bt_row + tok // KVB) * KVB + tok % KVB,
-                                    r_slot,
-                                    s * TOPK_TOKENS + j,
-                                    cache_modifier=CM_DEV,
-                                )
 
                     def candidates(level, prefix, remain, n_cand):
                         """Keys above the ``level`` bin go to red, the bin's to LDS."""
@@ -2650,19 +2615,17 @@ def build_flash_ffn_kernel(
                 tok = (kidx < nk).select(kidx, fx.Int32(0))
                 picked = fx.Int32(
                     bo.buffer_load(
-                        _rsrc(mb("slot_sel")),
+                        _rsrc(mb("tok_sel")),
                         s * TOPK_TOKENS + fx.min(kidx, TOPK_TOKENS - 1),
                         vec_width=1,
                         dtype=T.i32,
                         cache_modifier=CM_DEV,
                     )
                 )
-                # long rows: the selection published cache slots
-                tok_blk = long_row.select(
-                    picked // KVB, ld_i32(r_bt, bt * t32["bt_stride"] + tok // KVB)
-                )
+                tok = long_row.select(picked, tok)
+                tok_blk = ld_i32(r_bt, bt * t32["bt_stride"] + tok // KVB)
                 lds_st(keys, lane, tok_blk)
-                lds_st(keys, SPLIT_KEYS + lane, long_row.select(picked, tok) % KVB)
+                lds_st(keys, SPLIT_KEYS + lane, tok % KVB)
             # the row's own token is written by this launch's cache task
             get(mb("kv_ready"), s)
             fx.memory_fence(ordering=fx.AtomicOrdering.Acquire, syncscope="agent")
