@@ -281,7 +281,8 @@ def build_sparse_layer(
     )
     nvfp4 = str(attn.kv_cache_dtype) == "nvfp4"
     _need(
-        nvfp4 or (attn.use_aiter_sparse_pa and str(attn.kv_cache_dtype).startswith("fp8")),
+        nvfp4
+        or (attn.use_aiter_sparse_pa and str(attn.kv_cache_dtype).startswith("fp8")),
         f"layer {layer_id}: needs an NVFP4 KV cache or the AITER sparse PA path "
         "with an fp8 one",
     )

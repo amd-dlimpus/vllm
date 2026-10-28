@@ -28,12 +28,15 @@ from aiter.ops.flydsl.kernels.kernels_common import LOG2E
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
+from vllm.models.minimax_m3.amd.mono import config as mono_config
 from vllm.models.minimax_m3.amd.mono.config import (
     BLOCKS,
     HEAD_DIM,
     INDEX_CP_FROM_BLOCKS,
     MAX_INDEX_BLOCKS,
     MAX_TOKENS,
+    NVFP4_CODES,
+    NVFP4_INDEX_BLOCK,
     ONE_INDEX_HEAD,
     SPARSE_BLOCK,
     THREADS,
@@ -49,6 +52,8 @@ from vllm.models.minimax_m3.amd.mono.kernels.common import (
     kernel_symbol,
     lane_gather,
     mfma_bf16,
+    nvfp4_e4m3x8,
+    nvfp4_scale_pair,
     permlane_swap,
     readlane,
     rsrc,
@@ -210,12 +215,36 @@ def emit_index_scores(
         makes them MFMA operands."""
         words = []
         for i in tiles:
-            row = (page * INDEX_BLOCK_BYTES + (16 * i + l16) * HEAD_DIM + 32 * g4) // 4
-            for h in range_constexpr(2):
-                w = fx.Vector(
-                    bo.buffer_load(r_ic, row + 4 * h, vec_width=4, dtype=T.i32)
+            if const_expr(mono_config.KV_NVFP4):
+                # the key's codes of dims 32 g4 .. + 32 (16 B), its 8 scale bytes
+                t = 16 * i + l16
+                blk_dw = page * (NVFP4_INDEX_BLOCK // 4)
+                c = fx.Vector(
+                    bo.buffer_load(
+                        r_ic,
+                        blk_dw + t * (HEAD_DIM // 8) + 4 * g4,
+                        vec_width=4,
+                        dtype=T.i32,
+                    )
                 )
-                words += [w[e] for e in range(4)]
+                sc = fx.Vector(
+                    bo.buffer_load(
+                        r_ic,
+                        blk_dw + (NVFP4_CODES + t * (HEAD_DIM // 16)) // 4,
+                        vec_width=2,
+                        dtype=T.i32,
+                    )
+                )
+                words += [c[e] for e in range(4)] + [sc[0], sc[1]]
+            else:
+                row = (
+                    page * INDEX_BLOCK_BYTES + (16 * i + l16) * HEAD_DIM + 32 * g4
+                ) // 4
+                for h in range_constexpr(2):
+                    w = fx.Vector(
+                        bo.buffer_load(r_ic, row + 4 * h, vec_width=4, dtype=T.i32)
+                    )
+                    words += [w[e] for e in range(4)]
         return fx.Vector.from_elements(words, fx.Int32)
 
     def split_tiles(raw, tiles):
@@ -225,20 +254,38 @@ def emit_index_scores(
         g4 of every chunk s."""
         out = []
         for n in range_constexpr(len(tiles)):
-            d = [raw[8 * n + e] for e in range(8)]
-            # part j = dwords 2 j, 2 j + 1; lanes g4 and g4 ^ 2, then g4 ^ 1, trade
-            for off, pairs in ((32, ((0, 2), (1, 3))), (16, ((0, 1), (2, 3)))):
-                for a, b in pairs:
-                    for w in range_constexpr(2):
-                        d[2 * a + w], d[2 * b + w] = permlane_swap(
-                            off, d[2 * a + w], d[2 * b + w]
-                        )
-            out.append(
-                [
-                    fx.Vector.from_elements([d[2 * s], d[2 * s + 1]], fx.Int32)
-                    for s in range(HEAD_DIM // 32)
-                ]
-            )
+            if const_expr(mono_config.KV_NVFP4):
+                # the same transpose of 4 B code parts; lane g4's chunk s then
+                # sits under scale group 2 s + g4 / 2 of its key, dequantized to
+                # the FP8 path's bytes (index-K's global scale is 1)
+                d = [raw[6 * n + e] for e in range(4)]
+                for off, pairs in ((32, ((0, 2), (1, 3))), (16, ((0, 1), (2, 3)))):
+                    for a, b in pairs:
+                        d[a], d[b] = permlane_swap(off, d[a], d[b])
+                sc = [raw[6 * n + 4], raw[6 * n + 5]]
+                ops = []
+                for s in range_constexpr(HEAD_DIM // 32):
+                    sp = nvfp4_scale_pair(sc[s // 2], 2 * (s % 2) + g4 // 2)
+                    ops.append(
+                        fx.Vector.from_elements(nvfp4_e4m3x8(d[s], [sp] * 4), fx.Int32)
+                    )
+                out.append(ops)
+            else:
+                d = [raw[8 * n + e] for e in range(8)]
+                # part j = dwords 2 j, 2 j + 1; lanes g4 and g4 ^ 2, then g4 ^ 1,
+                # trade
+                for off, pairs in ((32, ((0, 2), (1, 3))), (16, ((0, 1), (2, 3)))):
+                    for a, b in pairs:
+                        for w in range_constexpr(2):
+                            d[2 * a + w], d[2 * b + w] = permlane_swap(
+                                off, d[2 * a + w], d[2 * b + w]
+                            )
+                out.append(
+                    [
+                        fx.Vector.from_elements([d[2 * s], d[2 * s + 1]], fx.Int32)
+                        for s in range(HEAD_DIM // 32)
+                    ]
+                )
         return out
 
     def tiles_max(b, qb, col_seq, tiles, kw):

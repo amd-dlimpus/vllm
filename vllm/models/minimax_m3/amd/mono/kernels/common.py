@@ -28,13 +28,14 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
 from aiter.ops.flydsl.kernels.kernels_common import kernel_signature
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
+from flydsl._mlir.dialects import arith, llvm
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T, as_ir_value
 
 from vllm.models.minimax_m3.amd.mono.config import LAYER_SLOTS, WAVES
+from vllm.models.minimax_m3.amd.ops.flydsl_utils import cvt_fp4x2_f16, cvt_fp8x2_f16
 
 # gfx95x cache policy bits (LLVM CPol): SC0 = 1, SC1 = 16. SC1 alone is device
 # scope (past the per-XCD caches); SC0 | SC1 is system scope (peers over XGMI).
@@ -225,6 +226,39 @@ def fp8x8_bf16_pk(words):
             )
             out.append(fx.Vector(p).bitcast(fx.Int32)[0])
     return fx.Vector.from_elements(out, fx.Int32).bitcast(fx.BFloat16)
+
+
+def nvfp4_e4m3x8(codes, scales):
+    """Eight e2m1 codes (nibble i: element i) -> e4m3_rn_satfinite(code x scale),
+    the stock NVFP4 kernels' values, as two dwords of fp8. ``scales[j]``: the E4M3
+    scales of elements 2 j, 2 j + 1 as two fp16; the fp16 products are exact, so
+    the only rounding is the final one to e4m3."""
+    nnan = ir.Attribute.parse("#arith.fastmath<nnan>")
+    big = fx.Vector.filled(2, 448.0, fx.Float16)
+    small = fx.Vector.filled(2, -448.0, fx.Float16)
+    f8 = [None, None]
+    for j in range_constexpr(4):
+        v = cvt_fp4x2_f16(codes, j) * scales[j]
+        v = arith.MinNumFOp(as_ir_value(v), as_ir_value(big), fastmath=nnan).result
+        v = arith.MaxNumFOp(v, as_ir_value(small), fastmath=nnan).result
+        old = fx.Vector.filled(2, 0, fx.Int16) if j % 2 == 0 else f8[j // 2]
+        f8[j // 2] = fx.Vector(
+            rocdl.cvt_scalef32_pk_fp8_f16(
+                fx.Vector.make_type(2, fx.Int16),
+                as_ir_value(old),
+                v,
+                as_ir_value(fx.Float32(1.0)),
+                j % 2 == 1,
+            )
+        )
+    return [f8[h].bitcast(fx.Int32)[0] for h in range_constexpr(2)]
+
+
+def nvfp4_scale_pair(word, byte):
+    """Scale byte ``byte`` of ``word`` as two fp16, for a code group under one
+    scale (``nvfp4_e4m3x8``)."""
+    sb = (fx.Int32(word) >> (byte * 8)) & 0xFF
+    return cvt_fp8x2_f16(sb | (sb << 8), False)
 
 
 def bf16_round(a):

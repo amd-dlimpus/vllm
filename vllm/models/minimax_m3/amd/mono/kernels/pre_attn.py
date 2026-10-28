@@ -39,6 +39,10 @@ from vllm.models.minimax_m3.amd.mono.config import (
     LOCAL_Q_HEADS,
     MAX_QKV_ROWS,
     MAX_TOKENS,
+    NVFP4_CODES,
+    NVFP4_INDEX_BLOCK,
+    NVFP4_KV_BLOCK,
+    NVFP4_SIDE,
     ONE_INDEX_HEAD,
     PAGE16,
     ROTARY_DIM,
@@ -90,17 +94,6 @@ ELEMS = 4  # per lane in a head task: 32 lanes x 4 = 128, the aiter kernel's spl
 PAGE_BYTES = PAGE16 * HEAD_DIM  # one page-16 of one kv head (fp8)
 
 
-# NVFP4 caches (KV_NVFP4), the stock insert's layout for one kv head: a block is a
-# K side then a V side of SPARSE_BLOCK * NVFP4_ROW bytes each. K: the codes
-# [key][64 bytes], then the scales swizzled by ``_k_scale_off``. V: per octet of
-# keys, one dword per dim holding the octet's 8 nibbles, then the scales
-# [group][key]. Index-K: the codes [key][64 bytes], then the scales [key][group].
-NVFP4_CODES = mono_config.SPARSE_BLOCK * (HEAD_DIM // 2)
-NVFP4_SIDE = mono_config.SPARSE_BLOCK * mono_config.NVFP4_ROW
-NVFP4_KV_BLOCK = 2 * NVFP4_SIDE
-NVFP4_INDEX_BLOCK = NVFP4_SIDE
-
-
 def _atomic_i32(op, addr, value):
     """Relaxed agent-scope atomic ``op`` on a global i32."""
     _llvm.AtomicRMWOp(
@@ -124,9 +117,7 @@ def store_nvfp4_rows(side, slot, l32, codes, sf, k_side, cm):
     t = slot & (mono_config.SPARSE_BLOCK - 1)
     grp = l32 // 4
     r = rsrc(side, NVFP4_SIDE)
-    bo.buffer_store(
-        codes.to(fx.Int16), r, t * (HEAD_DIM // 4) + l32, cache_modifier=cm
-    )
+    bo.buffer_store(codes.to(fx.Int16), r, t * (HEAD_DIM // 4) + l32, cache_modifier=cm)
     s_off = NVFP4_CODES + k_side.select(
         _k_scale_off(t, grp), t * (HEAD_DIM // 16) + grp
     )
@@ -849,6 +840,7 @@ def build_pre_attn_kernel(
         tl=timeline,
         kps=mono_config.KV_PAGE_STRIDE,
         sks=mono_config.STATIC_KV_SCALE,
+        kv4=mono_config.KV_NVFP4,
     )
 
     # the JIT cache key holds the kernel's scalar closure values, not objects: the

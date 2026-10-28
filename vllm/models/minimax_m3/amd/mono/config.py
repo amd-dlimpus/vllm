@@ -101,6 +101,15 @@ STATIC_KV_SCALE = False
 # dims, and K's scales are swizzled and V's codes octet-transposed (pre_attn.py)
 KV_NVFP4 = False
 NVFP4_ROW = HEAD_DIM // 2 + HEAD_DIM // 16
+# for one kv head: a block is a K side then a V side of NVFP4_SIDE bytes each. K:
+# the codes [key][64 bytes], then the scales swizzled (the stock insert's
+# ``_k_scale_off``). V: per octet of keys, one dword per dim holding the octet's 8
+# nibbles, then the scales [group][key]. Index-K, a block one side: the codes
+# [key][64 bytes], then the scales [key][group].
+NVFP4_CODES = SPARSE_BLOCK * (HEAD_DIM // 2)
+NVFP4_SIDE = SPARSE_BLOCK * NVFP4_ROW
+NVFP4_KV_BLOCK = 2 * NVFP4_SIDE
+NVFP4_INDEX_BLOCK = NVFP4_SIDE
 
 
 def configure(
